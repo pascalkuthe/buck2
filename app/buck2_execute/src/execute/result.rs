@@ -311,6 +311,53 @@ impl CommandExecutionResult {
     /// Resolves the output path as used by execution, a stable path it can be
     /// accessed at without holding a lock, and the artifact value.
     ///
+    /// See [`UploadableOutputs::resolve_outputs`].
+    pub fn resolve_outputs<'a>(
+        &'a self,
+        fs: &'a ArtifactFs,
+    ) -> impl Iterator<
+        Item = buck2_error::Result<(
+            ResolvedCommandExecutionOutput,
+            ProjectRelativePathBuf,
+            &'a ArtifactValue,
+        )>,
+    > + 'a {
+        self.uploadable_outputs().resolve_outputs(fs)
+    }
+
+    /// What a cache upload of this result writes.
+    pub fn uploadable_outputs(&self) -> UploadableOutputs<'_> {
+        UploadableOutputs {
+            outputs: &self.outputs,
+            std_streams: &self.report.std_streams,
+            start_time: self.report.timing.start_time,
+            end_time: self.report.timing.end_time(),
+        }
+    }
+}
+
+/// The parts of an action's result that a cache upload writes: its outputs, its std streams and
+/// when it ran. An execution provides all of them; a dep-file cache hit provides the outputs alone.
+#[derive(Clone, Copy)]
+pub struct UploadableOutputs<'a> {
+    pub outputs: &'a BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+    pub std_streams: &'a CommandStdStreams,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+}
+
+impl<'a> UploadableOutputs<'a> {
+    /// Total size of all outputs in bytes.
+    pub fn calc_output_size_bytes(&self) -> u64 {
+        self.outputs
+            .values()
+            .map(|v| v.calc_output_count_and_bytes(false).bytes)
+            .sum()
+    }
+
+    /// Resolves the output path as used by execution, a stable path it can be
+    /// accessed at without holding a lock, and the artifact value.
+    ///
     /// For content-based outputs, we resolve the outputs to the placeholder
     /// paths that are used during execution, so that e.g. remote execution can
     /// key on a path matching that used by execution.
@@ -320,8 +367,8 @@ impl CommandExecutionResult {
     /// is a [`ContentBasedPathHash::OutputArtifact`] path,
     /// concurrently-running `run` actions in different configurations may
     /// overwrite it.
-    pub fn resolve_outputs<'a>(
-        &'a self,
+    pub fn resolve_outputs(
+        self,
         fs: &'a ArtifactFs,
     ) -> impl Iterator<
         Item = buck2_error::Result<(

@@ -50,7 +50,9 @@ use buck2_execute::dep_file_state::DepFileStore;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::blocking::BlockingExecutor;
+use buck2_execute::execute::cache_uploader::CacheUploadOutcome;
 use buck2_execute::execute::cache_uploader::CacheUploadResults;
+use buck2_execute::execute::cache_uploader::DepFileHit;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::prepared::PreparedAction;
@@ -282,6 +284,13 @@ pub trait ActionExecutionCtx: Send + Sync {
         re_result: Option<TActionResult2>,
         dep_file_entry: Option<&mut dyn IntoRemoteDepFile>,
     ) -> buck2_error::Result<CacheUploadResults>;
+
+    /// Publish the result of a dep-file cache hit under the action's own digest.
+    async fn cache_upload_dep_file_hit(
+        &mut self,
+        action: &ActionDigestAndBlobs,
+        hit: DepFileHit<'_>,
+    ) -> buck2_error::Result<CacheUploadOutcome>;
 
     /// Executes a command
     /// TODO(bobyf) this seems like it deserves critical sections?

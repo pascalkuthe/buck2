@@ -21,6 +21,7 @@ use crate::digest_config::DigestConfig;
 use crate::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use crate::execute::dep_file_digest::DepFileDigest;
 use crate::execute::result::CommandExecutionResult;
+use crate::execute::result::UploadableOutputs;
 use crate::execute::target::CommandExecutionTarget;
 use crate::materialize::materializer::Materializer;
 use crate::re::error::RemoteExecutionError;
@@ -242,6 +243,32 @@ pub trait UploadCache: Send + Sync {
         dep_file_bundle: Option<&mut dyn IntoRemoteDepFile>,
         action_digest_and_blobs: &ActionDigestAndBlobs,
     ) -> buck2_error::Result<CacheUploadResults>;
+
+    /// Publish the result of a dep-file cache hit under the action's own digest.
+    ///
+    /// A dep-file hit proves the served outputs are what this action, with its current inputs,
+    /// would produce; it is the same guarantee the hit itself relies on. Without this, an action
+    /// rescued by the dep-file cache never gets an action cache entry for its current digest: the
+    /// next machine misses it, falls back to the dep-file cache, and recompiles if that entry has
+    /// since moved on.
+    async fn upload_dep_file_hit(
+        &self,
+        _info: &CacheUploadInfo<'_>,
+        _hit: DepFileHit<'_>,
+        _action_digest_and_blobs: &ActionDigestAndBlobs,
+    ) -> buck2_error::Result<CacheUploadOutcome> {
+        Ok(CacheUploadOutcome::ExecutorUploadDisabled)
+    }
+}
+
+/// What a dep-file cache hit served, for [`UploadCache::upload_dep_file_hit`].
+pub enum DepFileHit<'a> {
+    /// A remote dep-file cache hit: the action result that was served, its outputs already in the
+    /// CAS.
+    Remote(TActionResult2),
+    /// A local dep-file cache hit: the outputs matched locally, which may exist only on this
+    /// machine.
+    Local(UploadableOutputs<'a>),
 }
 
 /// A no-op cache uploader for when cache uploading is disabled

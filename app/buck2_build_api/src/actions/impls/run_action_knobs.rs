@@ -28,6 +28,11 @@ pub struct RunActionKnobs {
     /// Default for per-action `allow_cache_upload`, to make it opt-out instead of opt-in.
     pub default_allow_cache_upload: bool,
 
+    /// Publish an action cache entry under the action's own digest when the dep-file cache
+    /// (local or remote) serves an action, so the entry for its current inputs exists for the
+    /// next machine. Costs the action digest and an upload on every such hit.
+    pub upload_dep_file_hits: bool,
+
     pub action_paths_interner:
         Option<DashMapDirectoryInterner<ActionDirectoryMember, TrackedFileDigest>>,
 
