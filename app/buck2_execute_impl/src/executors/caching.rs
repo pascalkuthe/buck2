@@ -316,6 +316,7 @@ impl CacheUploader {
         result: &CommandExecutionResult,
         action_result: Option<TActionResult2>,
         dep_file_bundle: &mut dyn IntoRemoteDepFile,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
         remote_dep_file_action: &ActionDigestAndBlobs,
         error_on_cache_upload: bool,
     ) -> buck2_error::Result<CacheUploadOutcome> {
@@ -335,7 +336,7 @@ impl CacheUploader {
                     if let Err(rejected) = self.check_upload_permission(info).await? {
                         return Ok(rejected);
                     }
-                    let remote_dep_file = dep_file_bundle
+                    let mut remote_dep_file = dep_file_bundle
                         .make_remote_dep_file(
                             info.digest_config,
                             &self.artifact_fs,
@@ -347,6 +348,9 @@ impl CacheUploader {
                             DepFileUploadNoDeclaredDepFiles(remote_dep_file_key.clone())
                         })?;
 
+                    // Where this execution's outputs are cached, for a cache that keeps several
+                    // entries under one dep-file key.
+                    remote_dep_file.action_digest = action_digest_and_blobs.action.to_string();
                     let digest = remote_dep_file_action.action;
                     let dep_file_tany = TAny {
                         type_url: REMOTE_DEP_FILE_KEY.to_owned(),
@@ -643,6 +647,7 @@ impl UploadCache for CacheUploader {
                             res,
                             action_result,
                             dep_file_bundle,
+                            action_digest_and_blobs,
                             &remote_dep_file_action,
                             error_on_cache_upload,
                         )

@@ -160,27 +160,37 @@ async fn query_action_cache_and_download_result(
 
     let action_exit_code = response.action_result.exit_code;
 
-    let dep_file_metadata: Option<RemoteDepFile> = match &cache_type {
-        CacheType::ActionCache => None,
+    let (dep_file_metadata, remote_dep_file_candidates) = match &cache_type {
+        CacheType::ActionCache => (None, Vec::new()),
+        // A further entry found under the dep-file key: the action result under its own action
+        // digest is checked against it.
+        CacheType::RemoteDepFileCache(_) if request.remote_dep_file_candidate().is_some() => {
+            (request.remote_dep_file_candidate().cloned(), Vec::new())
+        }
         CacheType::RemoteDepFileCache(_) => {
-            let metadata = response
+            // Every entry the cache keeps for this key, most recent first. The first describes
+            // this action result's outputs; the rest point at their own.
+            let mut entries = Vec::new();
+            for metadata in response
                 .action_result
                 .execution_metadata
                 .auxiliary_metadata
                 .iter()
-                .find(|k| k.type_url == REMOTE_DEP_FILE_KEY);
-
-            if metadata.is_none() {
-                // No entry found
-                return ControlFlow::Continue(manager);
-            }
-            let dep_file_entry = match RemoteDepFile::decode(metadata.unwrap().value.as_slice()) {
-                Ok(entry) => entry,
-                Err(e) => {
-                    return ControlFlow::Break(manager.error("remote_dep_file", e));
+                .filter(|k| k.type_url == REMOTE_DEP_FILE_KEY)
+            {
+                match RemoteDepFile::decode(metadata.value.as_slice()) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        return ControlFlow::Break(manager.error("remote_dep_file", e));
+                    }
                 }
-            };
-            Some(dep_file_entry)
+            }
+            let mut entries = entries.into_iter();
+            match entries.next() {
+                // No entry found
+                None => return ControlFlow::Continue(manager),
+                Some(first) => (Some(first), entries.collect()),
+            }
         }
     };
 
@@ -232,6 +242,7 @@ async fn query_action_cache_and_download_result(
                 key,
             );
             res.dep_file_metadata = dep_file_metadata;
+            res.remote_dep_file_candidates = remote_dep_file_candidates;
             // Kept so that, once the hit is verified, the entry can also be published under the
             // action's own digest (`buck2.upload_dep_file_hits`).
             res.action_result = Some(response.0.action_result);

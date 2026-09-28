@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
 use buck2_artifact::artifact::artifact_type::OutputArtifact;
@@ -1128,6 +1129,67 @@ impl RunAction {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// When the entry under the dep-file key does not match, try the further entries the cache
+    /// keeps for it, most recent first: each names the action digest its outputs are cached
+    /// under. Returns the request as it came in.
+    async fn try_remote_dep_file_candidates(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        mut req: CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        dep_file_bundle: &DepFileBundle,
+        remote_dep_file_key: &DepFileDigest,
+        candidates: Vec<RemoteDepFile>,
+    ) -> buck2_error::Result<(
+        CommandExecutionRequest,
+        ControlFlow<CommandExecutionResult, ()>,
+    )> {
+        let mut found = ControlFlow::Continue(());
+        for candidate in candidates {
+            // Checked before a lookup: a candidate for other command lines or dep files is
+            // no use whatever its inputs.
+            if !dep_file_bundle.remote_dep_file_entry_applies(&candidate) {
+                continue;
+            }
+            let Ok((digest, _)) = DepFileDigest::parse_digest(
+                &candidate.action_digest,
+                ctx.digest_config().cas_digest_config(),
+            ) else {
+                continue;
+            };
+            req = req.with_remote_dep_file_candidate(&digest, Some(candidate));
+            let manager = ctx.command_execution_manager(WaitingData::new());
+            let ControlFlow::Break(res) = ctx
+                .remote_dep_file_cache(manager, &req, prepared_action)
+                .await
+            else {
+                continue;
+            };
+            // A failed lookup of a candidate is a miss, not the action's failure.
+            if !res.was_served_by_remote_dep_file_cache() {
+                continue;
+            }
+            if let ControlFlow::Break(res) = self
+                .check_cache_result_is_useable(
+                    ctx,
+                    &req,
+                    &prepared_action.action_and_blobs.action,
+                    res,
+                    dep_file_bundle,
+                    &digest,
+                )
+                .await?
+            {
+                found = ControlFlow::Break(res);
+                break;
+            }
+        }
+        Ok((
+            req.with_remote_dep_file_candidate(remote_dep_file_key, None),
+            found,
+        ))
+    }
+
     async fn execute_inner(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
@@ -1217,7 +1279,8 @@ impl RunAction {
                     let remote_dep_file_result = ctx
                         .remote_dep_file_cache(manager, &req, &prepared_action)
                         .await;
-                    if let ControlFlow::Break(res) = remote_dep_file_result {
+                    if let ControlFlow::Break(mut res) = remote_dep_file_result {
+                        let candidates = std::mem::take(&mut res.remote_dep_file_candidates);
                         // If the result was served by the remote dep file cache, we can't use the result just yet. We need to verify that
                         // the inputs tracked by a depfile that was actually used in the cache hit are identical to the inputs we have for this action.
                         let res = self
@@ -1230,6 +1293,20 @@ impl RunAction {
                                 &remote_dep_file_key,
                             )
                             .await?;
+                        let (req, res) = match res {
+                            ControlFlow::Break(res) => (req, ControlFlow::Break(res)),
+                            ControlFlow::Continue(()) => {
+                                self.try_remote_dep_file_candidates(
+                                    ctx,
+                                    req,
+                                    &prepared_action,
+                                    &dep_file_bundle,
+                                    &remote_dep_file_key,
+                                    candidates,
+                                )
+                                .await?
+                            }
+                        };
                         (
                             req,
                             res.map_continue(|_| ctx.command_execution_manager(WaitingData::new())),

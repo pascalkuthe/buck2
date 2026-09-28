@@ -246,6 +246,10 @@ pub struct CommandExecutionResult {
     /// This is picked up from the action result's auxiliary metadata and
     /// is used to verify the dep file cache lookup result
     pub dep_file_metadata: Option<RemoteDepFile>,
+    /// Further dep-file entries the remote dep-file cache holds for this key, most recent first,
+    /// each pointing at the action result of its own execution
+    /// ([`RemoteDepFile::action_digest`]). Tried in turn when `dep_file_metadata` does not match.
+    pub remote_dep_file_candidates: Vec<RemoteDepFile>,
     /// If the action executed on RE, the original action result
     /// to be re-used when uploading the remote dep file.
     #[derivative(Debug = "ignore")]

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allocative::Allocative;
+use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::local_resource_state::LocalResourceState;
 use buck2_core::content_hash::ContentBasedPathHash;
@@ -388,6 +389,10 @@ pub struct CommandExecutionRequest {
     /// Remote dep file key, if the action has a dep file.
     /// If this key is set and remote dep file caching is enabled, it will be used to query the cache.
     pub remote_dep_file_key: Option<DepFileDigest>,
+    /// A further dep-file entry to try, found under the remote dep-file key. When set,
+    /// `remote_dep_file_key` is that entry's action digest, and the action result found there
+    /// is checked against this entry rather than against the result's own metadata.
+    remote_dep_file_candidate: Option<RemoteDepFile>,
     /// RE gang workers for gang scheduling.
     re_gang_workers: Vec<ReGangWorker>,
     /// RE dependencies to pass in action metadata.
@@ -442,6 +447,7 @@ impl CommandExecutionRequest {
             remote_worker: None,
             unique_input_inodes: false,
             remote_dep_file_key: None,
+            remote_dep_file_candidate: None,
             re_gang_workers: Vec::new(),
             remote_execution_dependencies: Vec::new(),
             remote_execution_custom_image: None,
@@ -520,6 +526,22 @@ impl CommandExecutionRequest {
 
     pub fn remote_dep_file_key(&self) -> &Option<DepFileDigest> {
         &self.remote_dep_file_key
+    }
+
+    /// Look up `key` in the remote dep-file cache: a dep-file key when `candidate` is `None`,
+    /// otherwise the action digest of that further dep-file entry.
+    pub fn with_remote_dep_file_candidate(
+        mut self,
+        key: &DepFileDigest,
+        candidate: Option<RemoteDepFile>,
+    ) -> Self {
+        self.remote_dep_file_key = Some(key.dupe());
+        self.remote_dep_file_candidate = candidate;
+        self
+    }
+
+    pub fn remote_dep_file_candidate(&self) -> Option<&RemoteDepFile> {
+        self.remote_dep_file_candidate.as_ref()
     }
 
     pub fn prefetch_lossy_stderr(&self) -> bool {
