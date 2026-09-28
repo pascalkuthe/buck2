@@ -209,6 +209,9 @@ async fn query_action_cache_and_download_result(
                 key,
             );
             res.dep_file_metadata = dep_file_metadata;
+            // Kept so that, once the hit is verified, the entry can also be published under the
+            // action's own digest (`buck2.upload_dep_file_hits`).
+            res.action_result = Some(response.0.action_result);
         }
         CacheType::ActionCache => {
             tracing::info!(

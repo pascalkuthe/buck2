@@ -31,9 +31,11 @@ use buck2_execute::execute::cache_uploader::CacheUploadInfo;
 use buck2_execute::execute::cache_uploader::CacheUploadOutcome;
 use buck2_execute::execute::cache_uploader::CacheUploadResults;
 use buck2_execute::execute::cache_uploader::DepFileCacheUploadOutcome;
+use buck2_execute::execute::cache_uploader::DepFileHit;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::cache_uploader::UploadCache;
 use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::execute::result::UploadableOutputs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::client::ActionCacheWriteType;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
@@ -104,7 +106,7 @@ impl CacheUploader {
     async fn upload_local_outputs(
         &self,
         info: &CacheUploadInfo<'_>,
-        result: &CommandExecutionResult,
+        result: UploadableOutputs<'_>,
         action_digest_and_blobs: &ActionDigestAndBlobs,
         error_on_cache_upload: bool,
         has_depfile_entry: bool,
@@ -226,6 +228,84 @@ impl CacheUploader {
         Ok((outcome?, action_result_for_dep_file))
     }
 
+    /// Write an action result a remote dep-file cache hit served under the action's own digest.
+    /// Its outputs came out of the cache, so only the Action and the entry itself are written.
+    async fn write_served_action_result(
+        &self,
+        info: &CacheUploadInfo<'_>,
+        mut action_result: TActionResult2,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
+        error_on_cache_upload: bool,
+    ) -> buck2_error::Result<CacheUploadOutcome> {
+        let digest = action_digest_and_blobs.action;
+        let digest_str = digest.to_string();
+        // The dep-file entry's metadata describes the dep-file key, not this action.
+        action_result.execution_metadata.auxiliary_metadata.clear();
+
+        span_async(
+            buck2_data::CacheUploadStart {
+                key: Some(info.target.as_proto_action_key()),
+                name: Some(info.target.as_proto_action_name()),
+                action_digest: digest_str.clone(),
+            },
+            async {
+                let outcome = async {
+                    if let Err(rejected) = self.check_upload_permission(info).await? {
+                        return Ok(rejected);
+                    }
+                    // upload Action to CAS, which an ActionCache write through CAS requires.
+                    if let Err(error) = self
+                        .re_client
+                        .upload_files_and_directories(
+                            vec![],
+                            vec![],
+                            action_digest_and_blobs.blobs.to_inlined_blobs(),
+                        )
+                        .await
+                    {
+                        return Ok(CacheUploadOutcome::FailedUploadActionBlobs {
+                            error: error.into(),
+                        });
+                    }
+                    if let Err(error) = self
+                        .re_client
+                        .write_action_result(
+                            digest,
+                            action_result,
+                            &self.platform.to_re_platform(),
+                            ActionCacheWriteType::LocalCacheUpload,
+                        )
+                        .await
+                    {
+                        return Ok(CacheUploadOutcome::FailedWriteActionResult {
+                            error: error.into(),
+                        });
+                    }
+                    Ok(CacheUploadOutcome::Success)
+                }
+                .await
+                .unwrap_or_else(|error| CacheUploadOutcome::FailedOther { error });
+
+                let end_event = buck2_data::CacheUploadEnd {
+                    key: Some(info.target.as_proto_action_key()),
+                    name: Some(info.target.as_proto_action_name()),
+                    action_digest: digest_str.clone(),
+                    success: outcome.uploaded(),
+                    error: outcome.error(),
+                    re_error_code: outcome.re_error_code(),
+                    file_digests: Vec::new(),
+                    tree_digests: Vec::new(),
+                    output_bytes: None,
+                };
+                (
+                    outcome.log_and_create_result(&digest_str, error_on_cache_upload),
+                    Box::new(end_event),
+                )
+            },
+        )
+        .await
+    }
+
     /// Upload an action result with additional information about dep files to the RE action cache.
     /// The conditions for the upload are: the action must have been successful and produced a depfile
     /// and cache uploads must have been enabled for this action.
@@ -335,7 +415,7 @@ impl CacheUploader {
 
     async fn upload_files_and_directories(
         &self,
-        result: &CommandExecutionResult,
+        result: UploadableOutputs<'_>,
         file_digests: &mut Vec<TrackedFileDigest>,
         tree_digests: &mut Vec<TrackedFileDigest>,
         digest_config: DigestConfig,
@@ -442,7 +522,6 @@ impl CacheUploader {
 
         let std_streams = async {
             result
-                .report
                 .std_streams
                 .clone()
                 .into_re(&self.re_client, digest_config)
@@ -479,12 +558,8 @@ impl CacheUploader {
             execution_metadata: TExecutedActionMetadata {
                 worker,
                 execution_dir: "".to_owned(),
-                execution_start_timestamp: systemtime_to_ttimestamp(
-                    result.report.timing.start_time,
-                )?,
-                execution_completed_timestamp: systemtime_to_ttimestamp(
-                    result.report.timing.end_time(),
-                )?,
+                execution_start_timestamp: systemtime_to_ttimestamp(result.start_time)?,
+                execution_completed_timestamp: systemtime_to_ttimestamp(result.end_time)?,
                 execution_attempts: 1,
                 ..Default::default()
             },
@@ -525,7 +600,7 @@ impl UploadCache for CacheUploader {
             // TODO(bobyf, torozco) should these be critical sections?
             self.upload_local_outputs(
                 info,
-                res,
+                res.uploadable_outputs(),
                 action_digest_and_blobs,
                 error_on_cache_upload,
                 dep_file_bundle.is_some(),
@@ -587,6 +662,37 @@ impl UploadCache for CacheUploader {
             dep_file_cache_upload_outcome,
             dep_file_cache_upload_key,
         })
+    }
+
+    async fn upload_dep_file_hit(
+        &self,
+        info: &CacheUploadInfo<'_>,
+        hit: DepFileHit<'_>,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
+    ) -> buck2_error::Result<CacheUploadOutcome> {
+        let error_on_cache_upload = error_on_cache_upload().buck_error_context("cache_upload")?;
+        match hit {
+            DepFileHit::Remote(action_result) => {
+                self.write_served_action_result(
+                    info,
+                    action_result,
+                    action_digest_and_blobs,
+                    error_on_cache_upload,
+                )
+                .await
+            }
+            // The outputs may exist only here, so they are uploaded like an execution's.
+            DepFileHit::Local(outputs) => Ok(self
+                .upload_local_outputs(
+                    info,
+                    outputs,
+                    action_digest_and_blobs,
+                    error_on_cache_upload,
+                    false,
+                )
+                .await?
+                .0),
+        }
     }
 }
 

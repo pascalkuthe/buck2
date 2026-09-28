@@ -39,7 +39,9 @@ use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::HasBlockingExecutor;
 use buck2_execute::execute::cache_uploader::CacheUploadInfo;
+use buck2_execute::execute::cache_uploader::CacheUploadOutcome;
 use buck2_execute::execute::cache_uploader::CacheUploadResults;
+use buck2_execute::execute::cache_uploader::DepFileHit;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::claim::MutexClaimManager;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
@@ -653,6 +655,27 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
                 action_digest_and_blobs,
             )
             .await?)
+    }
+
+    async fn cache_upload_dep_file_hit(
+        &mut self,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
+        hit: DepFileHit<'_>,
+    ) -> buck2_error::Result<CacheUploadOutcome> {
+        let action = self.target();
+        self.executor
+            .command_executor
+            .cache_upload_dep_file_hit(
+                &CacheUploadInfo {
+                    target: &action as _,
+                    digest_config: self.digest_config(),
+                    mergebase: self.mergebase().0.as_ref(),
+                    re_platform: self.re_platform(),
+                },
+                hit,
+                action_digest_and_blobs,
+            )
+            .await
     }
 
     async fn cleanup_outputs(&self) -> buck2_error::Result<()> {

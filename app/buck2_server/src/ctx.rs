@@ -419,6 +419,7 @@ impl<'a> ServerCommandContext<'a> {
                 .use_network_action_output_cache,
             eager_dep_files,
             default_allow_cache_upload: false,
+            upload_dep_file_hits: false,
             action_paths_interner: None,
             deduplicate_get_digests_ttl_calls: false,
         };
@@ -840,6 +841,12 @@ impl DiceCommandUpdater<'_, '_> {
             .parse::<bool>(BuckconfigKeyRef {
                 section: "buck2",
                 property: "default_allow_cache_upload",
+            })?
+            .unwrap_or(false);
+        run_action_knobs.upload_dep_file_hits |= root_config
+            .parse::<bool>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "upload_dep_file_hits",
             })?
             .unwrap_or(false);
 

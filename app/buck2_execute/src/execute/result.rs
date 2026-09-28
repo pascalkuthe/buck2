@@ -315,6 +315,47 @@ impl CommandExecutionResult {
     ) -> impl Iterator<
         Item = buck2_error::Result<(ResolvedCommandExecutionOutput, &'a ArtifactValue)>,
     > + 'a {
+        self.uploadable_outputs().resolve_outputs(fs)
+    }
+
+    /// What a cache upload of this result writes.
+    pub fn uploadable_outputs(&self) -> UploadableOutputs<'_> {
+        UploadableOutputs {
+            outputs: &self.outputs,
+            std_streams: &self.report.std_streams,
+            start_time: self.report.timing.start_time,
+            end_time: self.report.timing.end_time(),
+        }
+    }
+}
+
+/// The parts of an action's result that a cache upload writes: its outputs, its std streams and
+/// when it ran. An execution provides all of them; a dep-file cache hit provides the outputs alone.
+#[derive(Clone, Copy)]
+pub struct UploadableOutputs<'a> {
+    pub outputs: &'a BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+    pub std_streams: &'a CommandStdStreams,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+}
+
+impl<'a> UploadableOutputs<'a> {
+    /// Total size of all outputs in bytes.
+    pub fn calc_output_size_bytes(&self) -> u64 {
+        self.outputs
+            .values()
+            .map(|v| v.calc_output_count_and_bytes(false).bytes)
+            .sum()
+    }
+
+    /// For content-based outputs, resolve the outputs to the "constant" (non-content-based) paths
+    /// that are used during execution.
+    pub fn resolve_outputs(
+        self,
+        fs: &'a ArtifactFs,
+    ) -> impl Iterator<
+        Item = buck2_error::Result<(ResolvedCommandExecutionOutput, &'a ArtifactValue)>,
+    > + 'a {
         self.outputs.iter().map(|(output, value)| {
             Ok((
                 output.as_ref().resolve(

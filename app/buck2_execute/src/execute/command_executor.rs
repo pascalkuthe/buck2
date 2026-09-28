@@ -40,6 +40,8 @@ use crate::digest_config::DigestConfig;
 use crate::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use crate::execute::action_digest_and_blobs::ActionDigestAndBlobsBuilder;
 use crate::execute::cache_uploader::CacheUploadInfo;
+use crate::execute::cache_uploader::CacheUploadOutcome;
+use crate::execute::cache_uploader::DepFileHit;
 use crate::execute::cache_uploader::IntoRemoteDepFile;
 use crate::execute::cache_uploader::UploadCache;
 use crate::execute::executor_stage;
@@ -164,6 +166,20 @@ impl CommandExecutor {
                 dep_file_bundle,
                 action_digest_and_blobs,
             )
+            .await
+    }
+
+    /// Publish the result of a dep-file cache hit under the action's own digest. See
+    /// [`UploadCache::upload_dep_file_hit`].
+    pub async fn cache_upload_dep_file_hit(
+        &self,
+        info: &CacheUploadInfo<'_>,
+        hit: DepFileHit<'_>,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
+    ) -> buck2_error::Result<CacheUploadOutcome> {
+        self.0
+            .cache_uploader
+            .upload_dep_file_hit(info, hit, action_digest_and_blobs)
             .await
     }
 

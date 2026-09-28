@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -75,14 +76,18 @@ use buck2_events::dispatch::span_async_simple;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
+use buck2_execute::execute::cache_uploader::DepFileHit;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+use buck2_execute::execute::output::CommandStdStreams;
+use buck2_execute::execute::prepared::PreparedAction;
 use buck2_execute::execute::request::ActionMetadataBlob;
 use buck2_execute::execute::request::CommandExecutionInput;
 use buck2_execute::execute::request::CommandExecutionOutput;
+use buck2_execute::execute::request::CommandExecutionOutputRef;
 use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
@@ -90,6 +95,7 @@ use buck2_execute::execute::request::RemoteWorkerSpec;
 use buck2_execute::execute::request::WorkerId;
 use buck2_execute::execute::request::WorkerSpec;
 use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::execute::result::UploadableOutputs;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_fs::fs_util;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
@@ -1119,6 +1125,16 @@ impl RunAction {
             .check_local_dep_file_cache_for_identical_action(ctx, self.outputs.as_slice())
             .await?;
         if let Some((outputs, metadata)) = outputs {
+            if self.uploads_dep_file_hits(ctx) {
+                let req = self.command_execution_request(
+                    ctx,
+                    prepared_run_action,
+                    host_sharing_requirements,
+                )?;
+                let prepared_action = ctx.prepare_action(&req, true)?;
+                self.upload_local_dep_file_hit(ctx, &req, &prepared_action, &outputs)
+                    .await?;
+            }
             return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
         }
 
@@ -1142,6 +1158,10 @@ impl RunAction {
                         .check_local_dep_file_cache(ctx, self.outputs.as_slice())
                         .await?;
                     if let Some((outputs, metadata)) = lookup {
+                        if self.uploads_dep_file_hits(ctx) {
+                            self.upload_local_dep_file_hit(ctx, &req, &prepared_action, &outputs)
+                                .await?;
+                        }
                         return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
                     }
                 }
@@ -1259,6 +1279,58 @@ impl RunAction {
             .map(|entry| entry.map(|(p, e)| CommandExecutionInput::IncrementalRemoteOutput(p, e)))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default())
+    }
+
+    /// Whether a dep-file cache hit of this action is also published under the action's own
+    /// digest (`buck2.upload_dep_file_hits`): only where the action may upload at all, and not
+    /// for incrementally-executed actions, whose cache key is not the one they execute under.
+    fn uploads_dep_file_hits(&self, ctx: &dyn ActionExecutionCtx) -> bool {
+        ctx.run_action_knobs().upload_dep_file_hits
+            && !self.inner.incremental_remote_outputs
+            && self
+                .inner
+                .allow_cache_upload
+                .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload)
+    }
+
+    /// Publish the outputs a local dep-file cache hit matched under this action's own digest.
+    /// The hit proves they are what the action's current inputs produce. It keeps no std streams,
+    /// so the entry has none.
+    async fn upload_local_dep_file_hit(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        req: &CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        outputs: &ActionOutputs,
+    ) -> buck2_error::Result<()> {
+        let mut uploadable = BuckIndexMap::default();
+        for output in req.outputs() {
+            let CommandExecutionOutputRef::BuildArtifact { path, output_type } = output else {
+                return Ok(());
+            };
+            let Some(value) = outputs.get(path) else {
+                return Ok(());
+            };
+            uploadable.insert(
+                CommandExecutionOutput::BuildArtifact {
+                    path: path.clone(),
+                    output_type,
+                },
+                value.dupe(),
+            );
+        }
+        let now = SystemTime::now();
+        ctx.cache_upload_dep_file_hit(
+            &prepared_action.action_and_blobs,
+            DepFileHit::Local(UploadableOutputs {
+                outputs: &uploadable,
+                std_streams: &CommandStdStreams::Empty,
+                start_time: now,
+                end_time: now,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     fn command_execution_request(
@@ -1657,7 +1729,13 @@ impl Action for RunAction {
         } else if !result.was_success() {
             result.cache_upload_result = buck2_data::UploadResult::ActionNotSuccessful;
         } else if result.was_served_by_remote_dep_file_cache() {
-            result.cache_upload_result = buck2_data::UploadResult::RemoteDepFileCacheHit;
+            result.cache_upload_result = match result.action_result.take() {
+                Some(action_result) if self.uploads_dep_file_hits(ctx) => ctx
+                    .cache_upload_dep_file_hit(&action_and_blobs, DepFileHit::Remote(action_result))
+                    .await?
+                    .to_proto(),
+                _ => buck2_data::UploadResult::RemoteDepFileCacheHit,
+            };
         } else if !allow_cache_upload {
             result.cache_upload_result = buck2_data::UploadResult::ActionUploadNotAllowed;
         }
