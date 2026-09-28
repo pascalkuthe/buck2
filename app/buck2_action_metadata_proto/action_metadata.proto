@@ -30,4 +30,15 @@ message RemoteDepFile {
   // Inputs to this action that are not tracked by any dep files
   bytes untagged_inputs_digest = 3;
   repeated DepFileInputs dep_file_inputs = 4;
+  // The digest ("hash:size") of the action whose execution this entry
+  // describes; the action cache entry under it holds that execution's outputs.
+  //
+  // An action result under a remote dep-file key may carry several
+  // RemoteDepFile entries in its auxiliary metadata, most recent first: a
+  // cache may keep the entries of several executions (several versions of the
+  // headers) instead of replacing the entry on every write. The first entry
+  // describes the action result's own outputs. When it does not match, buck2
+  // tries each further one by looking up its action digest. A cache that
+  // replaces the entry on every write keeps exactly one, as before.
+  string action_digest = 5;
 }

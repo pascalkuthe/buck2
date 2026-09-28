@@ -658,6 +658,8 @@ impl CommonDigests {
             output_paths_digest,
             untagged_inputs_digest,
             dep_file_inputs,
+            // Filled in by the uploader, which knows the action digest.
+            action_digest: String::new(),
         }
     }
 }
@@ -809,38 +811,33 @@ impl DepFileBundle {
         Ok(matching_result)
     }
 
-    pub(crate) async fn check_remote_dep_file_entry(
-        &self,
-        digest_config: DigestConfig,
-        fs: &ArtifactFs,
-        materializer: &dyn Materializer,
-        found: &RemoteDepFile,
-        result: &CommandExecutionResult,
-    ) -> buck2_error::Result<bool> {
+    /// Whether a remote dep-file entry was made for this action at all: the same command line,
+    /// outputs, untagged inputs and declared dep files. Needs no dep file contents.
+    pub(crate) fn remote_dep_file_entry_applies(&self, found: &RemoteDepFile) -> bool {
         // Everything in the common digest structure is included in the remote dep file key,
         // so they should be the same but it's good to double check.
         let common = &self.common_digests;
         if common.commandline_cli_digest.as_bytes() != found.commandline_cli_digest.as_slice() {
             tracing::debug!("Remote dep files miss: command cli digests are different");
-            return Ok(false);
+            return false;
         }
         if common.output_paths_digest.raw_digest().as_bytes()
             != found.output_paths_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: output paths digest are different");
-            return Ok(false);
+            return false;
         }
         if common.untagged_inputs_digest.raw_digest().as_bytes()
             != found.untagged_inputs_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: untagged inputs digest are different");
-            return Ok(false);
+            return false;
         }
 
         // Ensure the declared dep files are the same
         if self.declared_dep_files.tagged.len() != found.dep_file_inputs.len() {
             tracing::debug!("Remote dep files miss: declared dep file counts are different");
-            return Ok(false);
+            return false;
         }
         let different_dep_files_count = self
             .declared_dep_files
@@ -851,6 +848,20 @@ impl DepFileBundle {
             .count();
         if different_dep_files_count != 0 {
             tracing::debug!("Remote dep files miss: declared dep files are different");
+            return false;
+        }
+        true
+    }
+
+    pub(crate) async fn check_remote_dep_file_entry(
+        &self,
+        digest_config: DigestConfig,
+        fs: &ArtifactFs,
+        materializer: &dyn Materializer,
+        found: &RemoteDepFile,
+        result: &CommandExecutionResult,
+    ) -> buck2_error::Result<bool> {
+        if !self.remote_dep_file_entry_applies(found) {
             return Ok(false);
         }
 
