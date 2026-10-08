@@ -34,7 +34,16 @@ use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTabl
 /// materializer state sqlite db schema! If you forget to bump this version,
 /// then you can fix forward by bumping the `buck2.sqlite_materializer_state_version`
 /// buckconfig in the project root's .buckconfig.
+///
+/// Windows is one ahead: up to 9 it created every symlink pointing at its canonicalized target,
+/// the end of the symlink chain it passed through at the time, while the state recorded the
+/// declared target. Such a link is never rewritten while its declared target is unchanged, so
+/// dropping that state once makes every link be materialized again, the way `symlink` now
+/// writes it (see `fs_util::symlink_impl`).
+#[cfg(not(windows))]
 pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 9;
+#[cfg(windows)]
+pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 10;
 
 #[derive(Debug)]
 pub struct MaterializerStateEntry {

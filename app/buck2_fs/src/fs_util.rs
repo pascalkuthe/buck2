@@ -151,27 +151,28 @@ fn symlink_impl(original: &Path, link: &AbsPath) -> Result<(), IoError> {
     let target_abspath = std::path::absolute(&target_abspath).map_err(IoError::new)?;
 
     // Relative symlinks in Windows are relative from the real/canonical path of the link,
-    // so it can get messy when the symlink lives in buck-out. For Windows, we'll canonicalize,
-    // or if the target doesn't exist yet simulate canonicalize() by canonicalizing the common
-    // ancestor between the target and link and appending the rest. The common ancestor should
-    // live somewhere between repo root / buck-out and link's directory, which should both exist.
-    // Canonicalize() will also handle adding the verbatim prefix \\?\, which is required for
-    // supporting paths longer than 260
-    // In general, it should be OK to opt for absolute / canonical paths when possible as
-    // buck will not read any of these paths.
-    let target_canonical = if let Ok(path) = target_abspath.canonicalize() {
-        path
+    // so it can get messy when the symlink lives in buck-out. For Windows, we therefore store
+    // an absolute target: the common ancestor of link and target, canonicalized, joined with
+    // the rest of the target as written (`absolute()` above already resolved `.`/`..`
+    // lexically). The common ancestor lies somewhere between the repo root / buck-out and the
+    // link's directory, which both exist. Canonicalizing it also adds the verbatim prefix
+    // \\?\, which is required for supporting paths longer than 260.
+    //
+    // Only the ancestor is canonicalized, never the target itself: canonicalizing the target
+    // resolves the symlinks it passes through, so the link would point at wherever that chain
+    // ended when it was created. The materializer keeps a link whose declared target is
+    // unchanged ("already materialized, updating deps only"), so when a link further down the
+    // chain is later re-pointed (a symlinked_dir entry into a rebuilt content-based output),
+    // this link would keep resolving to the old output for as long as it stays on disk. Stored
+    // as written, Windows resolves the chain when the link is opened, as unix does.
+    let target_canonical = if let Some(common_path) = common_path(&target_abspath, link) {
+        let from_common = target_abspath
+            .strip_prefix(&common_path)
+            .map_err(|e| IoError::new(io::Error::other(e)))?;
+        let common_canonicalized = common_path.canonicalize().map_err(IoError::new)?;
+        common_canonicalized.join(from_common)
     } else {
-        // target doesn't exist yet, try to guess the canonical path
-        if let Some(common_path) = common_path(&target_abspath, link) {
-            let from_common = target_abspath
-                .strip_prefix(&common_path)
-                .map_err(|e| IoError::new(io::Error::other(e)))?;
-            let common_canonicalized = common_path.canonicalize().map_err(IoError::new)?;
-            common_canonicalized.join(from_common)
-        } else {
-            target_abspath
-        }
+        target_abspath
     };
 
     let target_metadata = target_canonical.metadata();
@@ -1021,6 +1022,31 @@ mod tests {
         fs_util::symlink(&target_path, &symlink_path)?;
         fs_util::write(&target_path, b"File content")?;
         assert_eq!(fs_util::read_to_string(&symlink_path)?, "File content");
+        Ok(())
+    }
+
+    #[test]
+    fn symlink_follows_retargeted_link_in_chain() -> buck2_error::Result<()> {
+        // The shape of a venv entry into a package's symlinked_dir whose own entry points at a
+        // content-based output: venv/ext -> pkg/ext -> out_<hash>/lib. When the output is
+        // rebuilt only pkg/ext is re-pointed; venv/ext keeps its declared target and must
+        // reach the new output (on Windows it used to stay pinned to the old one).
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        for (dir, content) in [("out_1", "old"), ("out_2", "new")] {
+            fs_util::create_dir_all(root.join(dir))?;
+            fs_util::write(root.join(dir).join("lib"), content)?;
+        }
+        fs_util::create_dir_all(root.join("pkg"))?;
+        fs_util::create_dir_all(root.join("venv"))?;
+        let hop = root.join("pkg/ext");
+        fs_util::symlink(Path::new("../out_1/lib"), &hop)?;
+        fs_util::symlink(Path::new("../pkg/ext"), &root.join("venv/ext"))?;
+        assert_eq!(fs_util::read_to_string(root.join("venv/ext"))?, "old");
+
+        fs_util::remove_file(&hop)?;
+        fs_util::symlink(Path::new("../out_2/lib"), &hop)?;
+        assert_eq!(fs_util::read_to_string(root.join("venv/ext"))?, "new");
         Ok(())
     }
 
