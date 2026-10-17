@@ -31,7 +31,6 @@ use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
-use buck2_core::tag_error;
 use buck2_core::tag_result;
 use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
@@ -69,7 +68,6 @@ use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
-use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute_local::CommandResult;
@@ -113,6 +111,7 @@ use crate::executors::worker::WorkerHandle;
 use crate::executors::worker::WorkerPool;
 use crate::incremental_actions_helper::get_incremental_path_map;
 use crate::incremental_actions_helper::save_content_based_incremental_state;
+use crate::materializers::deferred::tag_cas_not_found;
 use crate::sqlite::incremental_state_db::IncrementalDbState;
 
 #[derive(Debug, buck2_error::Error)]
@@ -1442,20 +1441,8 @@ pub async fn materialize_inputs(
     while let Some(res) = stream.next().await {
         match res {
             Ok(()) => {}
-            Err(MaterializationError::NotFound { source }) => {
-                let corrupted = source.info.origin.guaranteed_by_action_cache();
-
-                return Err(tag_error!(
-                    "cas_missing_fatal",
-                    MaterializationError::NotFound { source }.into(),
-                    quiet: true,
-                    task: false,
-                    daemon_in_memory_state_is_corrupted: true,
-                    action_cache_is_corrupted: corrupted
-                ));
-            }
             Err(e) => {
-                return Err(e.into());
+                return Err(tag_cas_not_found(e));
             }
         }
     }

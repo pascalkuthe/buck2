@@ -1291,7 +1291,65 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
     Ok(action_result)
 }
 
+/// True if the error chain carries a gRPC `NOT_FOUND` that never became an
+/// `REClientError`: a ByteStream `Read` or a whole `BatchReadBlobs` call the
+/// server answered with `NOT_FOUND`. A ByteStream stream error reaches us
+/// wrapped in an `io::Error`, whose `source()` skips the wrapped error, so the
+/// payload is checked too.
+fn is_grpc_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let status = cause.downcast_ref::<tonic::Status>().or_else(|| {
+            cause
+                .downcast_ref::<io::Error>()
+                .and_then(|e| e.get_ref())
+                .and_then(|e| e.downcast_ref::<tonic::Status>())
+        });
+        status.is_some_and(|s| s.code() == tonic::Code::NotFound)
+    })
+}
+
+/// Give a gRPC `NOT_FOUND` from a download the `REClientError` code the
+/// caller classifies on (buck2 reads `REClientError::code` to tell a missing
+/// CAS blob from any other failure). Per-blob `BatchReadBlobs` statuses already
+/// arrive as `REClientError` and pass through unchanged.
+fn classify_download_error(err: anyhow::Error) -> anyhow::Error {
+    if err.downcast_ref::<REClientError>().is_none() && is_grpc_not_found(&err) {
+        anyhow::Error::new(REClientError {
+            code: TCode::NOT_FOUND,
+            message: format!("{err:#}"),
+            group: TCodeReasonGroup::UNKNOWN,
+        })
+    } else {
+        err
+    }
+}
+
 async fn download_impl<Byt, BytRet, Cas>(
+    instance_name: &InstanceName,
+    request: DownloadRequest,
+    bystream_compressor: Option<Compressor>,
+    max_total_batch_size: usize,
+    cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
+    bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
+) -> anyhow::Result<DownloadResponse>
+where
+    Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
+    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
+    Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+{
+    download_impl_inner(
+        instance_name,
+        request,
+        bystream_compressor,
+        max_total_batch_size,
+        cas_f,
+        bystream_fut,
+    )
+    .await
+    .map_err(classify_download_error)
+}
+
+async fn download_impl_inner<Byt, BytRet, Cas>(
     instance_name: &InstanceName,
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
@@ -2375,6 +2433,178 @@ mod tests {
         )
         .await?;
 
+        Ok(())
+    }
+
+    fn assert_not_found(res: anyhow::Result<DownloadResponse>) {
+        let err = res.err().expect("download must fail");
+        let re_err = err
+            .downcast_ref::<REClientError>()
+            .expect("error must be an REClientError");
+        assert_eq!(re_err.code, TCode::NOT_FOUND, "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_download_bytestream_stream_not_found() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path1 = work.path().join("path1");
+        let path1 = path1.to_str().context("tempdir is not utf8")?;
+
+        let req = DownloadRequest {
+            file_digests: Some(vec![NamedDigestWithPermissions {
+                named_digest: NamedDigest {
+                    name: path1.to_owned(),
+                    digest: TDigest {
+                        hash: "aa".to_owned(),
+                        size_in_bytes: 3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                is_executable: false,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            None,
+            0, // forces the bytestream API
+            |_req| async { panic!("not called") },
+            |_req| async move {
+                anyhow::Ok(Box::pin(futures::stream::iter(vec![Err(
+                    tonic::Status::not_found("blob gone"),
+                )])))
+            },
+        )
+        .await;
+        assert_not_found(res);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_bytestream_read_not_found() -> anyhow::Result<()> {
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![TDigest {
+                hash: "aa".to_owned(),
+                size_in_bytes: 3,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            None,
+            0, // forces the bytestream API
+            |_req| async { panic!("not called") },
+            |_req| async move {
+                let r: anyhow::Result<
+                    Pin<
+                        Box<
+                            futures::stream::Iter<
+                                std::vec::IntoIter<Result<ReadResponse, tonic::Status>>,
+                            >,
+                        >,
+                    >,
+                > = Err(tonic::Status::not_found("blob gone").into());
+                r
+            },
+        )
+        .await;
+        assert_not_found(res);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_batch_rpc_not_found() -> anyhow::Result<()> {
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![TDigest {
+                hash: "aa".to_owned(),
+                size_in_bytes: 3,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            None,
+            100000,
+            |_req| async { Err(tonic::Status::not_found("blob gone").into()) },
+            |_req| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await;
+        assert_not_found(res);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_batch_blob_status_not_found() -> anyhow::Result<()> {
+        let digest = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![digest.clone()]),
+            ..Default::default()
+        };
+        let res = BatchReadBlobsResponse {
+            responses: vec![batch_read_blobs_response::Response {
+                digest: Some(tdigest_to(digest)),
+                data: vec![],
+                status: Some(Status {
+                    code: TCode::NOT_FOUND.0,
+                    message: "blob gone".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            None,
+            100000,
+            |_req| {
+                let res = res.clone();
+                async move { Ok(res) }
+            },
+            |_req| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await;
+        assert_not_found(res);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_other_error_unchanged() -> anyhow::Result<()> {
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![TDigest {
+                hash: "aa".to_owned(),
+                size_in_bytes: 3,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            None,
+            100000,
+            |_req| async { Err(tonic::Status::permission_denied("nope").into()) },
+            |_req| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await;
+        let err = res.err().expect("download must fail");
+        assert!(err.downcast_ref::<REClientError>().is_none(), "{err:#}");
         Ok(())
     }
 

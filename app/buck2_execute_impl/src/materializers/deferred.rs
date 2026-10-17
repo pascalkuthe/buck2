@@ -38,6 +38,7 @@ use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::tag_error;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::directory_iterator::DirectoryIteratorPathStack;
@@ -353,6 +354,28 @@ impl From<MaterializeEntryError> for SharedMaterializingError {
     }
 }
 
+/// Convert a materialization error, flagging a CAS `NotFound` as corrupted daemon
+/// state: the daemon holds a promise (usually an action-cache hit) whose blobs the
+/// cache no longer has, so the client's restarter re-runs the command on a fresh
+/// daemon, which looks the entry up again instead of trusting the stale promise.
+pub(crate) fn tag_cas_not_found(err: MaterializationError) -> buck2_error::Error {
+    match err {
+        MaterializationError::NotFound { source } => {
+            let corrupted = source.info.origin.guaranteed_by_action_cache();
+
+            tag_error!(
+                "cas_missing_fatal",
+                MaterializationError::NotFound { source }.into(),
+                quiet: true,
+                task: false,
+                daemon_in_memory_state_is_corrupted: true,
+                action_cache_is_corrupted: corrupted
+            )
+        }
+        err => err.into(),
+    }
+}
+
 #[async_trait]
 impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T> {
     fn name(&self) -> &str {
@@ -604,7 +627,8 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         let materialization_fut = recv
             .await
             .buck_error_context("Receiving materialization future from command thread.")?;
-        Ok(materialization_fut.try_collect().await?)
+        let res: Result<(), MaterializationError> = materialization_fut.try_collect().await;
+        res.map_err(tag_cas_not_found)
     }
 
     async fn try_materialize_final_artifact(
