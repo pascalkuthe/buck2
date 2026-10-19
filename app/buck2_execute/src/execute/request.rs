@@ -521,6 +521,10 @@ impl CommandExecutionRequest {
         &self.remote_dep_file_key
     }
 
+    pub fn remote_dep_file_key_mut(&mut self) -> &mut Option<DepFileDigest> {
+        &mut self.remote_dep_file_key
+    }
+
     pub fn prefetch_lossy_stderr(&self) -> bool {
         self.prefetch_lossy_stderr
     }

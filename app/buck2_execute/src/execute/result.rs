@@ -16,6 +16,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use allocative::Allocative;
+use buck2_action_metadata_proto::DepFileCandidate;
 use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_build_signals::env::WaitingData;
 use buck2_core::content_hash::ContentBasedPathHash;
@@ -245,6 +246,9 @@ pub struct CommandExecutionResult {
     /// This is picked up from the action result's auxiliary metadata and
     /// is used to verify the dep file cache lookup result
     pub dep_file_metadata: Option<RemoteDepFile>,
+    /// The other stored results of the remote dep-file key (the `DepFileCandidates` auxiliary
+    /// metadata), newest first; tried when `dep_file_metadata` does not match this build.
+    pub dep_file_candidates: Vec<DepFileCandidate>,
     /// If the action executed on RE, the original action result
     /// to be re-used when uploading the remote dep file.
     #[derivative(Debug = "ignore")]

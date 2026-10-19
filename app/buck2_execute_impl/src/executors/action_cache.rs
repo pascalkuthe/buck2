@@ -12,6 +12,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use buck2_action_metadata_proto::DEP_FILE_CANDIDATES_KEY;
+use buck2_action_metadata_proto::DepFileCandidate;
+use buck2_action_metadata_proto::DepFileCandidates;
 use buck2_action_metadata_proto::REMOTE_DEP_FILE_KEY;
 use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -37,6 +40,7 @@ use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use prost::Message;
+use remote_execution::TAny;
 
 use crate::incremental_actions_helper::save_content_based_incremental_state;
 use crate::re::download::DownloadResult;
@@ -160,6 +164,12 @@ async fn query_action_cache_and_download_result(
             Some(dep_file_entry)
         }
     };
+    let dep_file_candidates = match &cache_type {
+        CacheType::ActionCache => Vec::new(),
+        CacheType::RemoteDepFileCache(_) => {
+            dep_file_candidates(&response.action_result.execution_metadata.auxiliary_metadata)
+        }
+    };
 
     let identity = ReActionIdentity::new(
         command.target,
@@ -209,6 +219,7 @@ async fn query_action_cache_and_download_result(
                 key,
             );
             res.dep_file_metadata = dep_file_metadata;
+            res.dep_file_candidates = dep_file_candidates;
             // Kept so that, once the hit is verified, the entry can also be published under the
             // action's own digest (`buck2.upload_dep_file_hits`).
             res.action_result = Some(response.0.action_result);
@@ -347,6 +358,24 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
     }
 }
 
+/// The `DepFileCandidates` a dep-file cache returned next to its result, newest first. They are
+/// only an extra chance at a hit: a missing or undecodable message means no candidates.
+fn dep_file_candidates(auxiliary_metadata: &[TAny]) -> Vec<DepFileCandidate> {
+    let Some(metadata) = auxiliary_metadata
+        .iter()
+        .find(|m| m.type_url == DEP_FILE_CANDIDATES_KEY)
+    else {
+        return Vec::new();
+    };
+    match DepFileCandidates::decode(metadata.value.as_slice()) {
+        Ok(candidates) => candidates.candidates,
+        Err(e) => {
+            tracing::debug!("Ignoring undecodable dep file candidates: {e}");
+            Vec::new()
+        }
+    }
+}
+
 fn command_execution_kind_for_cache_type(
     cache_type: &CacheType,
     details: RemoteCommandExecutionDetails,
@@ -354,5 +383,54 @@ fn command_execution_kind_for_cache_type(
     match cache_type {
         CacheType::ActionCache => CommandExecutionKind::ActionCache { details },
         CacheType::RemoteDepFileCache(_) => CommandExecutionKind::RemoteDepFileCache { details },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_action_metadata_proto::CandidateDigest;
+
+    use super::*;
+
+    fn tany(type_url: &str, value: Vec<u8>) -> TAny {
+        TAny {
+            type_url: type_url.to_owned(),
+            value,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_dep_file_candidates_absent() {
+        assert!(dep_file_candidates(&[]).is_empty());
+        assert!(dep_file_candidates(&[tany(REMOTE_DEP_FILE_KEY, vec![1, 2, 3])]).is_empty());
+    }
+
+    #[test]
+    fn test_dep_file_candidates_decoded_in_order() {
+        let candidate = |b: u8| DepFileCandidate {
+            key: Some(CandidateDigest {
+                hash: vec![b; 32],
+                size_bytes: 7,
+            }),
+            dep_files: vec![CandidateDigest {
+                hash: vec![b + 1; 32],
+                size_bytes: 42,
+            }],
+            filtered_fingerprints: vec![vec![b + 2; 32]],
+        };
+        let message = DepFileCandidates {
+            candidates: vec![candidate(1), candidate(10)],
+        };
+        let metadata = [
+            tany(REMOTE_DEP_FILE_KEY, Vec::new()),
+            tany(DEP_FILE_CANDIDATES_KEY, message.encode_to_vec()),
+        ];
+        assert_eq!(dep_file_candidates(&metadata), message.candidates);
+    }
+
+    #[test]
+    fn test_dep_file_candidates_undecodable_is_none() {
+        assert!(dep_file_candidates(&[tany(DEP_FILE_CANDIDATES_KEY, vec![0xff; 3])]).is_empty());
     }
 }

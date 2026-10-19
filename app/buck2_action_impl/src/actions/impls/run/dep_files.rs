@@ -14,6 +14,8 @@ use std::sync::LazyLock;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_action_metadata_proto::CandidateDigest;
+use buck2_action_metadata_proto::DepFileCandidate;
 use buck2_action_metadata_proto::DepFileInputs;
 use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_artifact::artifact::artifact_type::Artifact;
@@ -809,38 +811,33 @@ impl DepFileBundle {
         Ok(matching_result)
     }
 
-    pub(crate) async fn check_remote_dep_file_entry(
-        &self,
-        digest_config: DigestConfig,
-        fs: &ArtifactFs,
-        materializer: &dyn Materializer,
-        found: &RemoteDepFile,
-        result: &CommandExecutionResult,
-    ) -> buck2_error::Result<bool> {
+    /// Whether a remote dep-file entry was made by this action: the digests the remote dep-file
+    /// key covers (equal under one key, but checked anyway) and the declared dep files.
+    fn remote_dep_file_entry_is_compatible(&self, found: &RemoteDepFile) -> bool {
         // Everything in the common digest structure is included in the remote dep file key,
         // so they should be the same but it's good to double check.
         let common = &self.common_digests;
         if common.commandline_cli_digest.as_bytes() != found.commandline_cli_digest.as_slice() {
             tracing::debug!("Remote dep files miss: command cli digests are different");
-            return Ok(false);
+            return false;
         }
         if common.output_paths_digest.raw_digest().as_bytes()
             != found.output_paths_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: output paths digest are different");
-            return Ok(false);
+            return false;
         }
         if common.untagged_inputs_digest.raw_digest().as_bytes()
             != found.untagged_inputs_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: untagged inputs digest are different");
-            return Ok(false);
+            return false;
         }
 
         // Ensure the declared dep files are the same
         if self.declared_dep_files.tagged.len() != found.dep_file_inputs.len() {
             tracing::debug!("Remote dep files miss: declared dep file counts are different");
-            return Ok(false);
+            return false;
         }
         let different_dep_files_count = self
             .declared_dep_files
@@ -851,17 +848,43 @@ impl DepFileBundle {
             .count();
         if different_dep_files_count != 0 {
             tracing::debug!("Remote dep files miss: declared dep files are different");
-            return Ok(false);
+            return false;
         }
+        true
+    }
 
-        let action_outputs = ActionOutputs::new(
-            result
-                .outputs
-                .iter()
-                .filter_map(|(o, v)| Some((o.as_ref().into_build_artifact()?.0.dupe(), v.dupe())))
-                .collect(),
-        );
+    /// The digests of the dep files a cache result carries, in declared order, or `None` if one
+    /// of them is not a file of the result.
+    fn remote_dep_file_digests(&self, outputs: &ActionOutputs) -> Option<Vec<CandidateDigest>> {
+        self.declared_dep_files
+            .tagged
+            .values()
+            .map(|declared| {
+                let value = outputs.get_from_artifact_path(&declared.output.get_path())?;
+                match value.entry() {
+                    DirectoryEntry::Leaf(ActionDirectoryMember::File(meta)) => {
+                        Some(CandidateDigest {
+                            hash: meta.digest.raw_digest().as_bytes().to_vec(),
+                            size_bytes: meta.digest.size() as i64,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
 
+    /// This build's filtered input fingerprints under the dep files of a remote dep-file cache
+    /// result: reads (materializes) the result's dep files, filters this build's tagged inputs to
+    /// the ones they list, and fingerprints them. `None` when the dep files cannot be
+    /// materialized.
+    async fn remote_filtered_fingerprints(
+        &self,
+        digest_config: DigestConfig,
+        fs: &ArtifactFs,
+        materializer: &dyn Materializer,
+        action_outputs: &ActionOutputs,
+    ) -> buck2_error::Result<Option<RemoteDepFileFingerprints>> {
         // Now we compare the filtered input digests.
         // To do this,
         // 1. Read the dep file contents, this should have been downloaded as part of the action cache lookup
@@ -871,7 +894,7 @@ impl DepFileBundle {
             false,
             // The declared dep files of this and the found action are the same
             &self.declared_dep_files,
-            &action_outputs,
+            action_outputs,
             fs,
             materializer,
         )
@@ -882,35 +905,165 @@ impl DepFileBundle {
             Some(dep_files) => dep_files,
             None => {
                 tracing::debug!("Remote dep files miss: Dep files cannot be materialized");
-                return Ok(false);
+                return Ok(None);
             }
         };
 
-        let computed_filtered_fingerprints = self
+        let fingerprints = self
             .shared_declared_inputs
             .clone()
             .ok_or_else(|| buck2_error::internal_error!("Dep files should have been declared"))?
             .unshare()
             .filter(dep_files, fs)?
-            .fingerprint(digest_config);
-
-        let different_digest_count = computed_filtered_fingerprints
+            .fingerprint(digest_config)
             .tagged
             .iter()
-            .zip(found.dep_file_inputs.iter())
-            .filter(|((_, f1), found)| {
-                f1.fingerprint().raw_digest().as_bytes() != found.filtered_fingerprint.as_slice()
-            })
-            .count();
+            .map(|(_, f)| f.fingerprint().raw_digest().as_bytes().to_vec())
+            .collect();
 
-        if different_digest_count != 0 {
+        Ok(Some(RemoteDepFileFingerprints {
+            dep_files: self.remote_dep_file_digests(action_outputs),
+            fingerprints,
+        }))
+    }
+
+    /// Checks a remote dep-file cache result against this build: a hit when the entry was made by
+    /// this action and this build's inputs filtered by the entry's dep files fingerprint the same as
+    /// the entry's. A miss carries this build's fingerprints under the entry's dep files when they
+    /// were computed, so candidates sharing those dep files can be checked without reading them
+    /// again.
+    pub(crate) async fn check_remote_dep_file_entry(
+        &self,
+        digest_config: DigestConfig,
+        fs: &ArtifactFs,
+        materializer: &dyn Materializer,
+        found: &RemoteDepFile,
+        result: &CommandExecutionResult,
+    ) -> buck2_error::Result<RemoteDepFileMatch> {
+        if !self.remote_dep_file_entry_is_compatible(found) {
+            return Ok(RemoteDepFileMatch::Miss(None));
+        }
+
+        let action_outputs = action_outputs_of(result);
+        let computed = match self
+            .remote_filtered_fingerprints(digest_config, fs, materializer, &action_outputs)
+            .await?
+        {
+            Some(computed) => computed,
+            None => return Ok(RemoteDepFileMatch::Miss(None)),
+        };
+
+        if !fingerprints_match(found, &computed.fingerprints) {
             tracing::debug!("Remote dep files miss: Filtered input digests are different");
-            return Ok(false);
+            return Ok(RemoteDepFileMatch::Miss(Some(computed)));
         }
 
         // Everything matches! The action from cache can be used.
-        Ok(true)
+        Ok(RemoteDepFileMatch::Hit)
     }
+
+    /// Checks the result of a dep-file candidate's own key, chosen because its listed dep files
+    /// and fingerprints match `known` (this build's fingerprints under those dep files). When the
+    /// result carries exactly those dep files the fingerprints are not computed again; otherwise
+    /// (a cache whose candidate list disagrees with the entry) this is the full check.
+    pub(crate) async fn check_remote_dep_file_candidate(
+        &self,
+        digest_config: DigestConfig,
+        fs: &ArtifactFs,
+        materializer: &dyn Materializer,
+        found: &RemoteDepFile,
+        result: &CommandExecutionResult,
+        known: &RemoteDepFileFingerprints,
+    ) -> buck2_error::Result<RemoteDepFileMatch> {
+        if !self.remote_dep_file_entry_is_compatible(found) {
+            return Ok(RemoteDepFileMatch::Miss(None));
+        }
+        let action_outputs = action_outputs_of(result);
+        if known.dep_files.is_some()
+            && self.remote_dep_file_digests(&action_outputs) == known.dep_files
+        {
+            return Ok(if fingerprints_match(found, &known.fingerprints) {
+                RemoteDepFileMatch::Hit
+            } else {
+                tracing::debug!("Remote dep files miss: candidate's fingerprints are different");
+                RemoteDepFileMatch::Miss(None)
+            });
+        }
+        self.check_remote_dep_file_entry(digest_config, fs, materializer, found, result)
+            .await
+    }
+}
+
+fn action_outputs_of(result: &CommandExecutionResult) -> ActionOutputs {
+    ActionOutputs::new(
+        result
+            .outputs
+            .iter()
+            .filter_map(|(o, v)| Some((o.as_ref().into_build_artifact()?.0.dupe(), v.dupe())))
+            .collect(),
+    )
+}
+
+fn fingerprints_match(found: &RemoteDepFile, computed: &[Vec<u8>]) -> bool {
+    found.dep_file_inputs.len() == computed.len()
+        && found
+            .dep_file_inputs
+            .iter()
+            .zip(computed.iter())
+            .all(|(found, computed)| found.filtered_fingerprint == *computed)
+}
+
+/// This build's filtered input fingerprints under one set of dep files.
+pub(crate) struct RemoteDepFileFingerprints {
+    /// The digests of the dep files, in declared order (`None` if they are not known).
+    pub(crate) dep_files: Option<Vec<CandidateDigest>>,
+    /// This build's filtered fingerprint per dep file, in declared order.
+    pub(crate) fingerprints: Vec<Vec<u8>>,
+}
+
+pub(crate) enum RemoteDepFileMatch {
+    /// The cache result can be used.
+    Hit,
+    /// The cache result cannot be used; this build's fingerprints under its dep files, if they
+    /// were computed.
+    Miss(Option<RemoteDepFileFingerprints>),
+}
+
+/// The dep-file candidates of a remote dep-file key grouped by their dep files: one group per
+/// distinct list of dep-file digests, in the order of their first (newest) candidate, each with
+/// its candidates' indices newest first. A malformed candidate (fingerprints not one per dep
+/// file) is left out.
+pub(crate) fn group_dep_file_candidates(
+    candidates: &[DepFileCandidate],
+) -> Vec<(&[CandidateDigest], Vec<usize>)> {
+    let mut groups: Vec<(&[CandidateDigest], Vec<usize>)> = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        if candidate.key.is_none()
+            || candidate.dep_files.len() != candidate.filtered_fingerprints.len()
+        {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(dep_files, _)| *dep_files == candidate.dep_files.as_slice())
+        {
+            Some((_, members)) => members.push(i),
+            None => groups.push((candidate.dep_files.as_slice(), vec![i])),
+        }
+    }
+    groups
+}
+
+/// The first (newest) of `members` whose filtered fingerprints equal `fingerprints`.
+pub(crate) fn matching_dep_file_candidate(
+    candidates: &[DepFileCandidate],
+    members: &[usize],
+    fingerprints: &[Vec<u8>],
+) -> Option<usize> {
+    members
+        .iter()
+        .copied()
+        .find(|&i| candidates[i].filtered_fingerprints == fingerprints)
 }
 
 pub(crate) fn make_dep_file_bundle<'a>(
@@ -2134,6 +2287,105 @@ mod tests {
     use buck2_hash::BuckIndexMap;
 
     use super::*;
+
+    fn digest(b: u8) -> CandidateDigest {
+        CandidateDigest {
+            hash: vec![b; 32],
+            size_bytes: b as i64,
+        }
+    }
+
+    fn candidate(key: u8, dep_files: &[u8], fingerprints: &[u8]) -> DepFileCandidate {
+        DepFileCandidate {
+            key: Some(digest(key)),
+            dep_files: dep_files.iter().map(|&b| digest(b)).collect(),
+            filtered_fingerprints: fingerprints.iter().map(|&b| vec![b; 32]).collect(),
+        }
+    }
+
+    #[test]
+    fn test_group_dep_file_candidates_by_dep_files_newest_first() {
+        let candidates = vec![
+            candidate(1, &[10], &[100]),
+            candidate(2, &[11], &[101]),
+            candidate(3, &[10], &[102]),
+            // Malformed: two fingerprints for one dep file.
+            candidate(4, &[10], &[103, 104]),
+            candidate(5, &[10, 11], &[105, 106]),
+            DepFileCandidate {
+                key: None,
+                ..candidate(6, &[10], &[107])
+            },
+            candidate(7, &[11], &[108]),
+        ];
+        let groups = group_dep_file_candidates(&candidates);
+        let groups: Vec<(Vec<CandidateDigest>, Vec<usize>)> = groups
+            .into_iter()
+            .map(|(dep_files, members)| (dep_files.to_vec(), members))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (vec![digest(10)], vec![0, 2]),
+                (vec![digest(11)], vec![1, 6]),
+                (vec![digest(10), digest(11)], vec![4]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_dep_file_candidates_empty() {
+        assert!(group_dep_file_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_matching_dep_file_candidate_picks_first_equal_fingerprints() {
+        let candidates = vec![
+            candidate(1, &[10], &[100]),
+            candidate(2, &[10], &[101]),
+            candidate(3, &[10], &[101]),
+        ];
+        let members = [0, 1, 2];
+        assert_eq!(
+            matching_dep_file_candidate(&candidates, &members, &[vec![101; 32]]),
+            Some(1)
+        );
+        assert_eq!(
+            matching_dep_file_candidate(&candidates, &members, &[vec![100; 32]]),
+            Some(0)
+        );
+        assert_eq!(
+            matching_dep_file_candidate(&candidates, &members, &[vec![99; 32]]),
+            None
+        );
+        // Only the group's members are considered.
+        assert_eq!(
+            matching_dep_file_candidate(&candidates, &[2], &[vec![100; 32]]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_fingerprints_match() {
+        let found = RemoteDepFile {
+            commandline_cli_digest: Vec::new(),
+            output_paths_digest: Vec::new(),
+            untagged_inputs_digest: Vec::new(),
+            dep_file_inputs: vec![
+                DepFileInputs {
+                    dep_file_path: "a".to_owned(),
+                    filtered_fingerprint: vec![1],
+                },
+                DepFileInputs {
+                    dep_file_path: "b".to_owned(),
+                    filtered_fingerprint: vec![2],
+                },
+            ],
+        };
+        assert!(fingerprints_match(&found, &[vec![1], vec![2]]));
+        assert!(!fingerprints_match(&found, &[vec![1], vec![3]]));
+        assert!(!fingerprints_match(&found, &[vec![1]]));
+    }
 
     #[test]
     fn test_dep_files_visitor_output_collection() {

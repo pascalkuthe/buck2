@@ -16,6 +16,7 @@ use std::time::SystemTime;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_action_metadata_proto::DepFileCandidate;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
 use buck2_artifact::artifact::artifact_type::OutputArtifact;
@@ -74,7 +75,6 @@ use buck2_error::buck2_error;
 use buck2_error::internal_error;
 use buck2_events::dispatch::span_async_simple;
 use buck2_execute::artifact::fs::ExecutorFs;
-use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::cache_uploader::DepFileHit;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
@@ -143,8 +143,12 @@ use strong_hash::StrongHash;
 use self::dep_files::DepFileBundle;
 use crate::actions::impls::offline;
 use crate::actions::impls::run::dep_files::DepFilesCommandLineVisitor;
+use crate::actions::impls::run::dep_files::RemoteDepFileFingerprints;
+use crate::actions::impls::run::dep_files::RemoteDepFileMatch;
 use crate::actions::impls::run::dep_files::RunActionDepFiles;
+use crate::actions::impls::run::dep_files::group_dep_file_candidates;
 use crate::actions::impls::run::dep_files::make_dep_file_bundle;
+use crate::actions::impls::run::dep_files::matching_dep_file_candidate;
 use crate::actions::impls::run::dep_files::populate_dep_files;
 use crate::actions::impls::run::metadata::metadata_content;
 use crate::context::run::RunActionError;
@@ -1052,8 +1056,8 @@ impl RunAction {
     pub(crate) async fn check_cache_result_is_useable(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
-        request: &CommandExecutionRequest,
-        action_digest: &ActionDigest,
+        request: &mut CommandExecutionRequest,
+        prepared_action: &PreparedAction,
         result: CommandExecutionResult,
         dep_file_bundle: &DepFileBundle,
         remote_dep_file_key: &DepFileDigest,
@@ -1063,35 +1067,204 @@ impl RunAction {
             return Ok(ControlFlow::Break(result));
         }
 
-        if let Some(found_dep_file_entry) = &result.dep_file_metadata {
-            let can_use = span_async_simple(
-                buck2_data::MatchDepFilesStart {
-                    checking_filtered_inputs: true,
-                    remote_cache: true,
-                },
-                dep_file_bundle.check_remote_dep_file_entry(
+        let Some(found_dep_file_entry) = &result.dep_file_metadata else {
+            // Continue through other options below
+            return Ok(ControlFlow::Continue(()));
+        };
+        let head = span_async_simple(
+            buck2_data::MatchDepFilesStart {
+                checking_filtered_inputs: true,
+                remote_cache: true,
+            },
+            dep_file_bundle.check_remote_dep_file_entry(
+                ctx.digest_config(),
+                ctx.fs(),
+                ctx.materializer(),
+                found_dep_file_entry,
+                &result,
+            ),
+            buck2_data::MatchDepFilesEnd {},
+        )
+        .await?;
+
+        let head_fingerprints = match head {
+            RemoteDepFileMatch::Hit => {
+                self.log_remote_dep_file_hit(request, prepared_action, remote_dep_file_key);
+                return Ok(ControlFlow::Break(result));
+            }
+            RemoteDepFileMatch::Miss(fingerprints) => fingerprints,
+        };
+
+        // The head result does not match this build. The cache may list more results of the key
+        // (`DepFileCandidates`); without that list this is a miss, as in upstream buck2.
+        let candidates = result.dep_file_candidates;
+        if candidates.is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let hit = self
+            .check_dep_file_candidates(
+                ctx,
+                request,
+                prepared_action,
+                dep_file_bundle,
+                remote_dep_file_key,
+                &candidates,
+                head_fingerprints,
+            )
+            .await;
+        // Later lookups and the upload of a fresh result use the dep-file key itself.
+        *request.remote_dep_file_key_mut() = Some(remote_dep_file_key.dupe());
+        match hit? {
+            Some(result) => {
+                self.log_remote_dep_file_hit(request, prepared_action, remote_dep_file_key);
+                Ok(ControlFlow::Break(result))
+            }
+            None => Ok(ControlFlow::Continue(())),
+        }
+    }
+
+    fn log_remote_dep_file_hit(
+        &self,
+        request: &CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        remote_dep_file_key: &DepFileDigest,
+    ) {
+        tracing::info!(
+            "Action result is cached via remote dep file cache, skipping execution of :\n```\n$ {}\n```\n for action `{}` with remote dep file key `{}`",
+            request.all_args_str(),
+            prepared_action.action_and_blobs.action,
+            &remote_dep_file_key,
+        );
+    }
+
+    /// Looks for a dep-file candidate whose used inputs match this build. Candidates are grouped
+    /// by their dep files: each distinct set of dep files is materialized and fingerprinted once
+    /// (the head result's set reuses `head_fingerprints`), through the result of the group's
+    /// newest candidate; the first candidate whose fingerprints match is then looked up under its
+    /// own key and returned as a remote dep-file cache hit.
+    async fn check_dep_file_candidates(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        request: &mut CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        dep_file_bundle: &DepFileBundle,
+        remote_dep_file_key: &DepFileDigest,
+        candidates: &[DepFileCandidate],
+        head_fingerprints: Option<RemoteDepFileFingerprints>,
+    ) -> buck2_error::Result<Option<CommandExecutionResult>> {
+        for (dep_files, members) in group_dep_file_candidates(candidates) {
+            // This build's fingerprints under the group's dep files: known already if the head
+            // result has the same dep files, else from the result of the group's newest candidate.
+            let mut fetched = None;
+            let mut fetched_fingerprints = None;
+            let known = match &head_fingerprints {
+                Some(head) if head.dep_files.as_deref() == Some(dep_files) => head,
+                _ => {
+                    let Some(result) = self
+                        .lookup_dep_file_candidate(
+                            ctx,
+                            request,
+                            prepared_action,
+                            remote_dep_file_key,
+                            &candidates[members[0]],
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Some(found) = &result.dep_file_metadata else {
+                        continue;
+                    };
+                    match dep_file_bundle
+                        .check_remote_dep_file_entry(
+                            ctx.digest_config(),
+                            ctx.fs(),
+                            ctx.materializer(),
+                            found,
+                            &result,
+                        )
+                        .await?
+                    {
+                        RemoteDepFileMatch::Hit => return Ok(Some(result)),
+                        RemoteDepFileMatch::Miss(None) => continue,
+                        RemoteDepFileMatch::Miss(Some(computed)) => {
+                            fetched = Some(members[0]);
+                            &*fetched_fingerprints.insert(computed)
+                        }
+                    }
+                }
+            };
+
+            let Some(matching) =
+                matching_dep_file_candidate(candidates, &members, &known.fingerprints)
+            else {
+                continue;
+            };
+            if fetched == Some(matching) {
+                // Its own result was checked in full above and did not match.
+                continue;
+            }
+            let Some(result) = self
+                .lookup_dep_file_candidate(
+                    ctx,
+                    request,
+                    prepared_action,
+                    remote_dep_file_key,
+                    &candidates[matching],
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(found) = &result.dep_file_metadata else {
+                continue;
+            };
+            if let RemoteDepFileMatch::Hit = dep_file_bundle
+                .check_remote_dep_file_candidate(
                     ctx.digest_config(),
                     ctx.fs(),
                     ctx.materializer(),
-                    found_dep_file_entry,
+                    found,
                     &result,
-                ),
-                buck2_data::MatchDepFilesEnd {},
-            )
-            .await?;
-
-            if can_use {
-                tracing::info!(
-                    "Action result is cached via remote dep file cache, skipping execution of :\n```\n$ {}\n```\n for action `{}` with remote dep file key `{}`",
-                    request.all_args_str(),
-                    action_digest,
-                    &remote_dep_file_key,
-                );
-                return Ok(ControlFlow::Break(result));
+                    known,
+                )
+                .await?
+            {
+                return Ok(Some(result));
             }
         }
-        // Continue through other options below
-        Ok(ControlFlow::Continue(()))
+        Ok(None)
+    }
+
+    /// The remote dep-file cache result stored under a candidate's own key, if the cache has one.
+    async fn lookup_dep_file_candidate(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        request: &mut CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        remote_dep_file_key: &DepFileDigest,
+        candidate: &DepFileCandidate,
+    ) -> Option<CommandExecutionResult> {
+        let key = candidate.key.as_ref()?;
+        let key = DepFileDigest::from_digest_bytes(
+            remote_dep_file_key.raw_digest().algorithm(),
+            &key.hash,
+            u64::try_from(key.size_bytes).ok()?,
+        )
+        .ok()?;
+        *request.remote_dep_file_key_mut() = Some(key);
+        let manager = ctx.command_execution_manager(WaitingData::new());
+        match ctx
+            .remote_dep_file_cache(manager, request, prepared_action)
+            .await
+        {
+            ControlFlow::Break(result) if result.was_served_by_remote_dep_file_cache() => {
+                Some(result)
+            }
+            // A candidate is only an extra chance at a hit: a missing entry or a failed lookup
+            // is a miss of that candidate.
+            _ => None,
+        }
     }
 
     async fn execute_inner(
@@ -1186,11 +1359,12 @@ impl RunAction {
                     if let ControlFlow::Break(res) = remote_dep_file_result {
                         // If the result was served by the remote dep file cache, we can't use the result just yet. We need to verify that
                         // the inputs tracked by a depfile that was actually used in the cache hit are identical to the inputs we have for this action.
+                        let mut req = req;
                         let res = self
                             .check_cache_result_is_useable(
                                 ctx,
-                                &req,
-                                &prepared_action.action_and_blobs.action,
+                                &mut req,
+                                &prepared_action,
                                 res,
                                 &dep_file_bundle,
                                 &remote_dep_file_key,

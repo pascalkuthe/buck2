@@ -31,3 +31,35 @@ message RemoteDepFile {
   bytes untagged_inputs_digest = 3;
   repeated DepFileInputs dep_file_inputs = 4;
 }
+
+// A content digest: the raw hash bytes (not hex) and the blob size.
+message CandidateDigest {
+  bytes hash = 1;
+  int64 size_bytes = 2;
+}
+
+// One more stored result of a remote dep-file key (`DEP_FILE_CANDIDATES_KEY`).
+//
+// A remote dep-file key leaves the tagged inputs (headers) out, so one key
+// has many valid results: one per version of the inputs the dep files list.
+// A cache that keeps several of them stores each under its own exact key and
+// returns the newest as the result of the dep-file key, with the others
+// listed in this message.
+message DepFileCandidate {
+  // The candidate's own key: the action digest to look its ActionResult up
+  // under (GetActionResult). The digest algorithm is the dep-file key's.
+  CandidateDigest key = 1;
+  // The digest of each dep file the candidate's action produced, in the
+  // order of RemoteDepFile.dep_file_inputs.
+  repeated CandidateDigest dep_files = 2;
+  // RemoteDepFile.dep_file_inputs[i].filtered_fingerprint of the candidate,
+  // same order and length as dep_files.
+  repeated bytes filtered_fingerprints = 3;
+}
+
+// Carried in ActionResult.execution_metadata.auxiliary_metadata with the type
+// URL `DEP_FILE_CANDIDATES_KEY`, next to the `RemoteDepFile` entry of the
+// result it accompanies. Newest first.
+message DepFileCandidates {
+  repeated DepFileCandidate candidates = 1;
+}
