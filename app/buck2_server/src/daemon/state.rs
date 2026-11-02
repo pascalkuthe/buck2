@@ -467,6 +467,13 @@ impl DaemonState {
                     .unwrap_or_else(RolloutPercentage::never)
                     .roll();
 
+                let ttl_refresh_materialized = root_config
+                    .parse(BuckconfigKeyRef {
+                        section: "buck2",
+                        property: "ttl_refresh_materialized",
+                    })?
+                    .unwrap_or(false);
+
                 let update_access_times = AccessTimesUpdates::try_new_from_config_value(
                     root_config.get(BuckconfigKeyRef {
                         section: "buck2",
@@ -509,6 +516,7 @@ impl DaemonState {
                         frequency: std::time::Duration::from_secs(ttl_refresh_frequency),
                         min_ttl: jiff::SignedDuration::from_secs(ttl_refresh_min_ttl),
                         enabled: ttl_refresh_enabled,
+                        materialized: ttl_refresh_materialized,
                     },
                     update_access_times,
                     verbose_materializer_log,

@@ -329,6 +329,7 @@ mod state_machine {
             self: &Arc<Self>,
             _tree: &ArtifactTree,
             _min_ttl: SignedDuration,
+            _materialized_since: Option<jiff::Timestamp>,
         ) -> Option<BoxFuture<'static, buck2_error::Result<()>>> {
             unimplemented!()
         }
@@ -518,6 +519,7 @@ mod state_machine {
                         frequency: std::time::Duration::default(),
                         min_ttl: jiff::SignedDuration::ZERO,
                         enabled: false,
+                        materialized: false,
                     },
                     AccessTimesUpdates::Disabled,
                     clean_stale_config,

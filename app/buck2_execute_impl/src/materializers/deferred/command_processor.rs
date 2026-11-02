@@ -122,6 +122,10 @@ pub(super) struct DeferredMaterializerCommandProcessor<T: 'static> {
     pub(super) ttl_refresh_history: Vec<TtlRefreshHistoryEntry>,
     /// The current ttl_refresh instance, if any exists.
     ttl_refresh_instance: Option<oneshot::Receiver<(Timestamp, buck2_error::Result<()>)>>,
+    /// When `ttl_refresh_materialized` is on: the time of the previous refresh (the daemon start
+    /// before the first one). Materialized artifacts accessed after it are reported by the next
+    /// refresh. `None` when the flag is off.
+    pub(super) ttl_refresh_materialized_since: Option<Timestamp>,
     pub(super) cancellations: &'static CancellationContext,
     pub(super) stats: Arc<DeferredMaterializerStats>,
     access_times_buffer: Option<StdBuckHashSet<ProjectRelativePathBuf>>,
@@ -423,6 +427,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         let subscriptions = MaterializerSubscriptions::new();
         let ttl_refresh_history = Vec::new();
         let ttl_refresh_instance = None;
+        let ttl_refresh_materialized_since = None;
         let version_tracker = VersionTracker::new();
         let eager_materializations = EagerMaterializations::new();
         let root_abs_path = AbsPath::new("/").ok().map(|p| Arc::new(p.to_owned()));
@@ -437,6 +442,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             subscriptions,
             ttl_refresh_history,
             ttl_refresh_instance,
+            ttl_refresh_materialized_since,
             cancellations,
             stats,
             access_times_buffer,
@@ -603,6 +609,10 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             counters,
         } = commands;
 
+        if ttl_refresh.materialized {
+            self.ttl_refresh_materialized_since = Some(Timestamp::now());
+        }
+
         let refresh_ttl_ticker = if ttl_refresh.enabled {
             Some(tokio::time::interval_at(
                 tokio::time::Instant::now() + ttl_refresh.frequency,
@@ -650,9 +660,10 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                     self.poll_current_ttl_refresh();
 
                     if self.ttl_refresh_instance.is_none() {
+                        let materialized_since = self.take_ttl_refresh_materialized_since();
                         let ttl_refresh = self
                             .io
-                            .create_ttl_refresh(&self.tree, ttl_refresh.min_ttl)
+                            .create_ttl_refresh(&self.tree, ttl_refresh.min_ttl, materialized_since)
                             .map(|fut| {
                                 // We sue a channel here and not JoinHandle so we get blocking
                                 // `try_recv`.
@@ -902,6 +913,12 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
 
     /// Poll the current TTL refresh and remove it if it's done. Add the outcome to
     /// ttl_refresh_history.
+    pub(super) fn take_ttl_refresh_materialized_since(&mut self) -> Option<Timestamp> {
+        let since = self.ttl_refresh_materialized_since?;
+        self.ttl_refresh_materialized_since = Some(Timestamp::now());
+        Some(since)
+    }
+
     pub(super) fn poll_current_ttl_refresh(&mut self) {
         self.ttl_refresh_instance = match self.ttl_refresh_instance.take() {
             Some(mut curr) => match curr.try_recv() {

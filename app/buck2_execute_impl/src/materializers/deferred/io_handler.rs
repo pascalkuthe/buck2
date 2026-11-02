@@ -18,6 +18,7 @@ use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
+use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory::Directory;
@@ -164,6 +165,7 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         self: &Arc<Self>,
         tree: &ArtifactTree,
         min_ttl: SignedDuration,
+        materialized_since: Option<Timestamp>,
     ) -> Option<BoxFuture<'static, buck2_error::Result<()>>>;
 
     fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir>;
@@ -475,9 +477,16 @@ impl IoHandler for DefaultIoHandler {
         self: &Arc<Self>,
         tree: &ArtifactTree,
         min_ttl: SignedDuration,
+        materialized_since: Option<Timestamp>,
     ) -> Option<BoxFuture<'static, buck2_error::Result<()>>> {
-        create_ttl_refresh(tree, &self.re_client_manager, min_ttl, self.digest_config)
-            .map(|f| f.boxed())
+        create_ttl_refresh(
+            tree,
+            &self.re_client_manager,
+            min_ttl,
+            materialized_since,
+            self.digest_config,
+        )
+        .map(|f| f.boxed())
     }
 
     fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir> {
@@ -587,6 +596,7 @@ impl IoHandler for NoDiskIoHandler {
         self: &Arc<Self>,
         _tree: &ArtifactTree,
         _min_ttl: SignedDuration,
+        _materialized_since: Option<Timestamp>,
     ) -> Option<BoxFuture<'static, buck2_error::Result<()>>> {
         None
     }
@@ -648,11 +658,43 @@ fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDiges
     Ok(digest)
 }
 
+/// Collect the file digests of every materialized artifact whose `last_access_time` is later
+/// than `since`. External symlinks and other non-file leaves are skipped.
+pub(super) fn materialized_digests_accessed_since<'a>(
+    stages: impl IntoIterator<Item = &'a ArtifactMaterializationStage>,
+    since: Timestamp,
+) -> StdBuckHashSet<TrackedFileDigest> {
+    let mut digests = StdBuckHashSet::default();
+    for stage in stages {
+        if let ArtifactMaterializationStage::Materialized {
+            metadata,
+            last_access_time,
+            ..
+        } = stage
+            && *last_access_time > since
+        {
+            let mut walk = unordered_entry_walk(metadata.as_ref().map_dir(Directory::as_ref));
+            while let Some((_entry_path, entry)) = walk.next() {
+                if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
+                    digests.insert(file.digest.dupe());
+                }
+            }
+        }
+    }
+    digests
+}
+
 /// Spawn a task to refresh TTLs.
+///
+/// When `materialized_since` is set, the file digests of materialized artifacts accessed after
+/// that time are also sent through `get_digest_expirations`. The answer for those is ignored: the
+/// call only exists so the cache server sees the blobs as used (it treats a `FindMissingBlobs`
+/// hit as a use).
 pub(super) fn create_ttl_refresh(
     tree: &ArtifactTree,
     re_manager: &Arc<ReConnectionManager>,
     min_ttl: SignedDuration,
+    materialized_since: Option<Timestamp>,
     digest_config: DigestConfig,
 ) -> Option<impl Future<Output = buck2_error::Result<()>> + use<>> {
     let mut digests_to_refresh = StdBuckHashMap::<_, StdBuckHashSet<_>>::new();
@@ -681,7 +723,14 @@ pub(super) fn create_ttl_refresh(
         }
     }
 
-    if digests_to_refresh.is_empty() {
+    let materialized_digests = match materialized_since {
+        Some(since) => {
+            materialized_digests_accessed_since(tree.iter_without_paths().map(|d| &d.stage), since)
+        }
+        None => StdBuckHashSet::default(),
+    };
+
+    if digests_to_refresh.is_empty() && materialized_digests.is_empty() {
         return None;
     }
 
@@ -733,6 +782,19 @@ pub(super) fn create_ttl_refresh(
                     digest.update_expires(*expires);
                 }
             }
+        }
+
+        // Materialized artifacts in use: report them to the cache server, ignore the answer.
+        let mut materialized_digests = materialized_digests.into_iter().collect::<Vec<_>>();
+        materialized_digests.sort();
+        for chunk in materialized_digests.as_slice().chunks(REFRESH_CHUNK_SIZE) {
+            tracing::debug!("Report {} materialized digests", chunk.len());
+
+            re_client
+                .dupe()
+                .with_use_case(RemoteExecutorUseCase::buck2_default())
+                .get_digest_expirations(chunk.iter().map(|d| d.to_re()).collect())
+                .await?;
         }
 
         buck2_error::Ok(())
@@ -808,5 +870,99 @@ impl IoRequest for CleanIoRequest {
         );
 
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+    use buck2_execute::artifact_value::ArtifactValue;
+    use buck2_execute::digest_config::DigestConfig;
+    use buck2_execute::directory::ActionDirectoryBuilder;
+    use buck2_execute::directory::INTERNER;
+    use buck2_execute::directory::insert_file;
+    use buck2_hash::StdBuckHashSet;
+    use dupe::Dupe;
+    use jiff::SignedDuration;
+    use jiff::Timestamp;
+
+    use super::materialized_digests_accessed_since;
+    use crate::materializers::deferred::ArtifactMaterializationMethod;
+    use crate::materializers::deferred::ArtifactMaterializationStage;
+
+    fn file(content: &str, digest_config: DigestConfig) -> FileMetadata {
+        FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                content.as_bytes(),
+                digest_config.cas_digest_config(),
+            ),
+            is_executable: false,
+        }
+    }
+
+    fn materialized(
+        value: &ArtifactValue,
+        last_access_time: Timestamp,
+    ) -> ArtifactMaterializationStage {
+        ArtifactMaterializationStage::Materialized {
+            metadata: value.entry().dupe(),
+            last_access_time,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn test_materialized_digests_accessed_since() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let since = Timestamp::now();
+        let before = since - SignedDuration::from_secs(10);
+        let after = since + SignedDuration::from_secs(10);
+
+        let old_file = file("old", digest_config);
+        let new_file = file("new", digest_config);
+        let nested_a = file("nested a", digest_config);
+        let nested_b = file("nested b", digest_config);
+        let declared_file = file("declared", digest_config);
+
+        let mut builder = ActionDirectoryBuilder::empty();
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("a.txt".to_owned()),
+            nested_a.dupe(),
+        )?;
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("sub/b.txt".to_owned()),
+            nested_b.dupe(),
+        )?;
+        let dir = builder
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+
+        let stages = vec![
+            // Accessed before `since`: not reported.
+            materialized(&ArtifactValue::file(old_file.dupe()), before),
+            // Accessed exactly at `since`: not reported (strictly later only).
+            materialized(&ArtifactValue::file(old_file.dupe()), since),
+            // Accessed after `since`: reported, directories recursively.
+            materialized(&ArtifactValue::file(new_file.dupe()), after),
+            materialized(&ArtifactValue::dir(dir), after),
+            // Declared artifacts are not this helper's business.
+            ArtifactMaterializationStage::Declared {
+                entry: ArtifactValue::file(declared_file.dupe()).entry().dupe(),
+                method: std::sync::Arc::new(ArtifactMaterializationMethod::Test),
+            },
+        ];
+
+        let got = materialized_digests_accessed_since(&stages, since);
+        let expected: StdBuckHashSet<TrackedFileDigest> = [new_file, nested_a, nested_b]
+            .into_iter()
+            .map(|f| f.digest)
+            .collect();
+        assert_eq!(got, expected);
+
+        Ok(())
     }
 }

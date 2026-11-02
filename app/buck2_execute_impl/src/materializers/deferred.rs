@@ -212,6 +212,9 @@ pub struct TtlRefreshConfiguration {
     pub frequency: std::time::Duration,
     pub min_ttl: SignedDuration,
     pub enabled: bool,
+    /// Also report the file digests of materialized artifacts accessed since the previous refresh
+    /// (`[buck2] ttl_refresh_materialized`). The answer is ignored for those.
+    pub materialized: bool,
 }
 
 #[derive(Clone, Copy, Debug, Dupe, PartialEq)]
@@ -891,6 +894,7 @@ impl DeferredMaterializerAccessor<NoDiskIoHandler> {
                     frequency: std::time::Duration::default(),
                     min_ttl: SignedDuration::ZERO,
                     enabled: false,
+                    materialized: false,
                 },
                 update_access_times: AccessTimesUpdates::Disabled,
                 verbose_materializer_log: false,

@@ -270,10 +270,12 @@ struct RefreshTtls {
 
 impl<T: IoHandler> ExtensionCommand<T> for RefreshTtls {
     fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
+        let materialized_since = processor.take_ttl_refresh_materialized_since();
         let task = create_ttl_refresh(
             &processor.tree,
             processor.io.re_client_manager(),
             SignedDuration::from_secs(self.min_ttl),
+            materialized_since,
             processor.io.digest_config(),
         )
         .map(|f| processor.spawn(&EventDispatcher::error_on_event(), f));
