@@ -109,6 +109,10 @@ async fn query_action_cache_and_download_result(
         CacheType::RemoteDepFileCache(_) => Some(DepFileCandidatesLookup::LocalFirst),
         CacheType::ActionCache => None,
     };
+    let test_pack = match &cache_type {
+        CacheType::ActionCache => request.test_pack().map(str::to_owned),
+        CacheType::RemoteDepFileCache(_) => None,
+    };
 
     let action_cache_response = executor_stage_async(
         buck2_data::CacheQuery {
@@ -119,6 +123,7 @@ async fn query_action_cache_and_download_result(
             digest.dupe(),
             &command.prepared_action.platform,
             candidates_lookup,
+            test_pack,
         ),
     )
     .await;

@@ -688,6 +688,10 @@ impl REClient {
                             MetadataValue::from_static(lookup.header_value()),
                         );
                     }
+                    if let Some(pack) = &request.test_pack {
+                        msg.metadata_mut()
+                            .insert("x-kbuck-test-pack", MetadataValue::try_from(pack.as_str())?);
+                    }
                     msg
                 })
                 .await?;

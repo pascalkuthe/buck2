@@ -218,6 +218,38 @@ pub struct CommandExecutionPaths {
     input_files_bytes: u64,
 }
 
+/// The pack a cached test execution's result belongs in, for a cache that keeps the
+/// results of one test target and set of inputs together.
+///
+/// Computed from the input artifacts alone, not from the REAPI input root:
+/// [`CommandExecutionPaths::new`] adds each declared output's directory to that tree,
+/// and a test's output root hashes the case names, so the root differs per case.
+pub fn test_pack_key(
+    target: &str,
+    inputs: &[CommandExecutionInput],
+    digest_config: DigestConfig,
+    fs: &ArtifactFs,
+) -> buck2_error::Result<String> {
+    let root = inputs_directory(inputs, digest_config, fs)?
+        .fingerprint(digest_config.as_directory_serializer());
+    Ok(test_pack_key_of(target, &root.fingerprint().to_string()))
+}
+
+fn test_pack_key_of(target: &str, input_root: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for part in [
+        "kbuck-test-pack-1",
+        std::env::consts::OS,
+        target,
+        input_root,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 impl CommandExecutionPaths {
     pub fn new(
         inputs: Vec<CommandExecutionInput>,
@@ -390,6 +422,9 @@ pub struct CommandExecutionRequest {
     /// The next remote dep-file lookup asks for the candidates the cache did not answer
     /// with yet, because none of those matched.
     refresh_dep_file_candidates: bool,
+    /// For a test execution whose result is cached: the pack its result belongs in.
+    /// See [`test_pack_key`].
+    test_pack: Option<String>,
     /// RE gang workers for gang scheduling.
     re_gang_workers: Vec<ReGangWorker>,
     /// RE dependencies to pass in action metadata.
@@ -445,6 +480,7 @@ impl CommandExecutionRequest {
             unique_input_inodes: false,
             remote_dep_file_key: None,
             refresh_dep_file_candidates: false,
+            test_pack: None,
             re_gang_workers: Vec::new(),
             remote_execution_dependencies: Vec::new(),
             remote_execution_custom_image: None,
@@ -535,6 +571,15 @@ impl CommandExecutionRequest {
 
     pub fn set_refresh_dep_file_candidates(&mut self, refresh: bool) {
         self.refresh_dep_file_candidates = refresh;
+    }
+
+    pub fn test_pack(&self) -> Option<&str> {
+        self.test_pack.as_deref()
+    }
+
+    pub fn with_test_pack(mut self, test_pack: String) -> Self {
+        self.test_pack = Some(test_pack);
+        self
     }
 
     pub fn prefetch_lossy_stderr(&self) -> bool {
@@ -977,5 +1022,25 @@ impl ResolvedCommandExecutionOutput {
             OutputCreationBehavior::Create => Some(&self.path),
             OutputCreationBehavior::Parent => self.path.parent(),
         }
+    }
+}
+
+#[cfg(test)]
+mod test_pack_tests {
+    use super::test_pack_key_of;
+
+    #[test]
+    fn the_key_is_a_digest_of_the_target_and_its_inputs() {
+        let key = test_pack_key_of("root//a:t", "input");
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_eq!(key, test_pack_key_of("root//a:t", "input"));
+        assert_ne!(key, test_pack_key_of("root//a:u", "input"));
+        assert_ne!(key, test_pack_key_of("root//a:t", "other"));
+        // The parts cannot run into each other.
+        assert_ne!(test_pack_key_of("ab", "c"), test_pack_key_of("a", "bc"));
     }
 }

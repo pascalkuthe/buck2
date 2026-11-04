@@ -364,12 +364,19 @@ impl ManagedRemoteExecutionClient {
         action_digest: ActionDigest,
         platform: &RE::Platform,
         dep_file_candidates: Option<RE::DepFileCandidatesLookup>,
+        test_pack: Option<String>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         Ok(self
             .lock()?
             .get()
             .await?
-            .action_cache(action_digest, self.use_case, platform, dep_file_candidates)
+            .action_cache(
+                action_digest,
+                self.use_case,
+                platform,
+                dep_file_candidates,
+                test_pack,
+            )
             .await
             .ok()
             .flatten())

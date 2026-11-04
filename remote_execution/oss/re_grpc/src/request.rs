@@ -40,6 +40,9 @@ pub struct ActionResultRequest {
     pub platform: Option<TPlatform>,
     /// How a cache that keeps several results per remote dep-file key should answer.
     pub dep_file_candidates: Option<DepFileCandidatesLookup>,
+    /// The pack holding this test execution's result, as lowercase hex. Sent as the
+    /// `x-kbuck-test-pack` gRPC header; any other cache ignores it.
+    pub test_pack: Option<String>,
     pub _dot_dot: (),
 }
 

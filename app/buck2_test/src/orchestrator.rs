@@ -109,6 +109,7 @@ use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::request::OutputCreationBehavior;
 use buck2_execute::execute::request::WorkerId;
 use buck2_execute::execute::request::WorkerSpec;
+use buck2_execute::execute::request::test_pack_key;
 use buck2_execute::execute::result::CommandCancellationReason;
 use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionReport;
@@ -645,6 +646,19 @@ impl<'a> BuckTestOrchestrator<'a> {
         )
         .boxed()
         .await?;
+        let execution_request =
+            if effective_test_execution_caching && matches!(*stage, TestStage::Testing { .. }) {
+                let target = test_target.target().unconfigured().to_string();
+                let key = test_pack_key(
+                    &target,
+                    execution_request.inputs(),
+                    dice.global_data().get_digest_config(),
+                    fs,
+                )?;
+                execution_request.with_test_pack(key)
+            } else {
+                execution_request
+            };
         let result = Self::execute_request(
             dice,
             cancellation,
