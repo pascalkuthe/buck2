@@ -387,6 +387,9 @@ pub struct CommandExecutionRequest {
     /// Remote dep file key, if the action has a dep file.
     /// If this key is set and remote dep file caching is enabled, it will be used to query the cache.
     pub remote_dep_file_key: Option<DepFileDigest>,
+    /// The next remote dep-file lookup asks for the candidates the cache did not answer
+    /// with yet, because none of those matched.
+    refresh_dep_file_candidates: bool,
     /// RE gang workers for gang scheduling.
     re_gang_workers: Vec<ReGangWorker>,
     /// RE dependencies to pass in action metadata.
@@ -441,6 +444,7 @@ impl CommandExecutionRequest {
             remote_worker: None,
             unique_input_inodes: false,
             remote_dep_file_key: None,
+            refresh_dep_file_candidates: false,
             re_gang_workers: Vec::new(),
             remote_execution_dependencies: Vec::new(),
             remote_execution_custom_image: None,
@@ -523,6 +527,14 @@ impl CommandExecutionRequest {
 
     pub fn remote_dep_file_key_mut(&mut self) -> &mut Option<DepFileDigest> {
         &mut self.remote_dep_file_key
+    }
+
+    pub fn refresh_dep_file_candidates(&self) -> bool {
+        self.refresh_dep_file_candidates
+    }
+
+    pub fn set_refresh_dep_file_candidates(&mut self, refresh: bool) {
+        self.refresh_dep_file_candidates = refresh;
     }
 
     pub fn prefetch_lossy_stderr(&self) -> bool {

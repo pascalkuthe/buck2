@@ -254,13 +254,16 @@ impl RemoteExecutionClient {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        dep_file_candidates: Option<RE::DepFileCandidatesLookup>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         self.data
             .action_cache
-            .op(self
-                .data
-                .client
-                .action_cache(action_digest, use_case, platform))
+            .op(self.data.client.action_cache(
+                action_digest,
+                use_case,
+                platform,
+                dep_file_candidates,
+            ))
             .await
     }
 
@@ -1057,6 +1060,7 @@ impl RemoteExecutionClientImpl {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        dep_file_candidates: Option<RE::DepFileCandidatesLookup>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         if let Some(m) = &*INDUCED_CACHE_MISSES {
             if m.get(&action_digest.to_string())
@@ -1076,6 +1080,7 @@ impl RemoteExecutionClientImpl {
                     ActionResultRequest {
                         digest: action_digest.to_re(),
                         platform: Some(re_platform(platform)),
+                        dep_file_candidates,
                         ..Default::default()
                     },
                 )

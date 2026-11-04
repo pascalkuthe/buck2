@@ -62,4 +62,8 @@ message DepFileCandidate {
 // result it accompanies. Newest first.
 message DepFileCandidates {
   repeated DepFileCandidate candidates = 1;
+  // The cache answered only from what it has on this machine, without asking a
+  // slower tier behind it. When nothing here matches, the client may ask again
+  // with `x-kbuck-dep-file-candidates: refresh`.
+  bool local_only = 2;
 }

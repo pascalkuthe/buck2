@@ -672,15 +672,24 @@ impl REClient {
             let res = self
                 .action_cache_client()
                 .await?
-                .get_action_result(with_re_metadata(
-                    GetActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.digest.clone())),
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
+                .get_action_result({
+                    let mut msg = with_re_metadata(
+                        GetActionResultRequest {
+                            instance_name: self.instance_name.as_str().to_owned(),
+                            action_digest: Some(tdigest_to(request.digest.clone())),
+                            ..Default::default()
+                        },
+                        metadata,
+                        self.runtime_opts.use_fbcode_metadata,
+                    );
+                    if let Some(lookup) = request.dep_file_candidates {
+                        msg.metadata_mut().insert(
+                            "x-kbuck-dep-file-candidates",
+                            MetadataValue::from_static(lookup.header_value()),
+                        );
+                    }
+                    msg
+                })
                 .await?;
 
             Ok(ActionResultResponse {

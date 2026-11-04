@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buck2_action_metadata_proto::DEP_FILE_CANDIDATES_KEY;
-use buck2_action_metadata_proto::DepFileCandidate;
 use buck2_action_metadata_proto::DepFileCandidates;
 use buck2_action_metadata_proto::REMOTE_DEP_FILE_KEY;
 use buck2_action_metadata_proto::RemoteDepFile;
@@ -40,6 +39,7 @@ use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use prost::Message;
+use remote_execution::DepFileCandidatesLookup;
 use remote_execution::TAny;
 
 use crate::incremental_actions_helper::save_content_based_incremental_state;
@@ -102,13 +102,24 @@ async fn query_action_cache_and_download_result(
         CacheType::RemoteDepFileCache(key) => key.dupe().coerce::<ActionDigestKind>(),
         CacheType::ActionCache => action_digest.dupe(),
     };
+    let candidates_lookup = match &cache_type {
+        CacheType::RemoteDepFileCache(_) if request.refresh_dep_file_candidates() => {
+            Some(DepFileCandidatesLookup::Refresh)
+        }
+        CacheType::RemoteDepFileCache(_) => Some(DepFileCandidatesLookup::LocalFirst),
+        CacheType::ActionCache => None,
+    };
 
     let action_cache_response = executor_stage_async(
         buck2_data::CacheQuery {
             action_digest: digest.to_string(),
             cache_type: cache_type.to_proto().into(),
         },
-        re_client.action_cache(digest.dupe(), &command.prepared_action.platform),
+        re_client.action_cache(
+            digest.dupe(),
+            &command.prepared_action.platform,
+            candidates_lookup,
+        ),
     )
     .await;
 
@@ -165,7 +176,7 @@ async fn query_action_cache_and_download_result(
         }
     };
     let dep_file_candidates = match &cache_type {
-        CacheType::ActionCache => Vec::new(),
+        CacheType::ActionCache => DepFileCandidates::default(),
         CacheType::RemoteDepFileCache(_) => {
             dep_file_candidates(&response.action_result.execution_metadata.auxiliary_metadata)
         }
@@ -219,7 +230,8 @@ async fn query_action_cache_and_download_result(
                 key,
             );
             res.dep_file_metadata = dep_file_metadata;
-            res.dep_file_candidates = dep_file_candidates;
+            res.dep_file_candidates = dep_file_candidates.candidates;
+            res.dep_file_candidates_local_only = dep_file_candidates.local_only;
             // Kept so that, once the hit is verified, the entry can also be published under the
             // action's own digest (`buck2.upload_dep_file_hits`).
             res.action_result = Some(response.0.action_result);
@@ -360,18 +372,18 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
 
 /// The `DepFileCandidates` a dep-file cache returned next to its result, newest first. They are
 /// only an extra chance at a hit: a missing or undecodable message means no candidates.
-fn dep_file_candidates(auxiliary_metadata: &[TAny]) -> Vec<DepFileCandidate> {
+fn dep_file_candidates(auxiliary_metadata: &[TAny]) -> DepFileCandidates {
     let Some(metadata) = auxiliary_metadata
         .iter()
         .find(|m| m.type_url == DEP_FILE_CANDIDATES_KEY)
     else {
-        return Vec::new();
+        return DepFileCandidates::default();
     };
     match DepFileCandidates::decode(metadata.value.as_slice()) {
-        Ok(candidates) => candidates.candidates,
+        Ok(candidates) => candidates,
         Err(e) => {
             tracing::debug!("Ignoring undecodable dep file candidates: {e}");
-            Vec::new()
+            DepFileCandidates::default()
         }
     }
 }
@@ -389,6 +401,7 @@ fn command_execution_kind_for_cache_type(
 #[cfg(test)]
 mod tests {
     use buck2_action_metadata_proto::CandidateDigest;
+    use buck2_action_metadata_proto::DepFileCandidate;
 
     use super::*;
 
@@ -402,8 +415,11 @@ mod tests {
 
     #[test]
     fn test_dep_file_candidates_absent() {
-        assert!(dep_file_candidates(&[]).is_empty());
-        assert!(dep_file_candidates(&[tany(REMOTE_DEP_FILE_KEY, vec![1, 2, 3])]).is_empty());
+        assert_eq!(dep_file_candidates(&[]), DepFileCandidates::default());
+        assert_eq!(
+            dep_file_candidates(&[tany(REMOTE_DEP_FILE_KEY, vec![1, 2, 3])]),
+            DepFileCandidates::default()
+        );
     }
 
     #[test]
@@ -421,16 +437,20 @@ mod tests {
         };
         let message = DepFileCandidates {
             candidates: vec![candidate(1), candidate(10)],
+            local_only: true,
         };
         let metadata = [
             tany(REMOTE_DEP_FILE_KEY, Vec::new()),
             tany(DEP_FILE_CANDIDATES_KEY, message.encode_to_vec()),
         ];
-        assert_eq!(dep_file_candidates(&metadata), message.candidates);
+        assert_eq!(dep_file_candidates(&metadata), message);
     }
 
     #[test]
     fn test_dep_file_candidates_undecodable_is_none() {
-        assert!(dep_file_candidates(&[tany(DEP_FILE_CANDIDATES_KEY, vec![0xff; 3])]).is_empty());
+        assert_eq!(
+            dep_file_candidates(&[tany(DEP_FILE_CANDIDATES_KEY, vec![0xff; 3])]),
+            DepFileCandidates::default()
+        );
     }
 }

@@ -1123,6 +1123,39 @@ impl RunAction {
         }
     }
 
+    /// The cache answered from what it has on this machine (`local_only`) and none of that
+    /// matched this build: ask again for what it can only get from the shared tier. The answer
+    /// holds only candidates not tried yet, so it is checked like any other.
+    async fn refresh_dep_file_candidates(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        request: &mut CommandExecutionRequest,
+        prepared_action: &PreparedAction,
+        dep_file_bundle: &DepFileBundle,
+        remote_dep_file_key: &DepFileDigest,
+    ) -> buck2_error::Result<ControlFlow<CommandExecutionResult, ()>> {
+        request.set_refresh_dep_file_candidates(true);
+        let manager = ctx.command_execution_manager(WaitingData::new());
+        let refreshed = ctx
+            .remote_dep_file_cache(manager, request, prepared_action)
+            .await;
+        request.set_refresh_dep_file_candidates(false);
+        match refreshed {
+            ControlFlow::Break(result) => {
+                self.check_cache_result_is_useable(
+                    ctx,
+                    request,
+                    prepared_action,
+                    result,
+                    dep_file_bundle,
+                    remote_dep_file_key,
+                )
+                .await
+            }
+            ControlFlow::Continue(_) => Ok(ControlFlow::Continue(())),
+        }
+    }
+
     fn log_remote_dep_file_hit(
         &self,
         request: &CommandExecutionRequest,
@@ -1360,6 +1393,7 @@ impl RunAction {
                         // If the result was served by the remote dep file cache, we can't use the result just yet. We need to verify that
                         // the inputs tracked by a depfile that was actually used in the cache hit are identical to the inputs we have for this action.
                         let mut req = req;
+                        let local_only = res.dep_file_candidates_local_only;
                         let res = self
                             .check_cache_result_is_useable(
                                 ctx,
@@ -1370,6 +1404,19 @@ impl RunAction {
                                 &remote_dep_file_key,
                             )
                             .await?;
+                        let res = match res {
+                            ControlFlow::Continue(()) if local_only => {
+                                self.refresh_dep_file_candidates(
+                                    ctx,
+                                    &mut req,
+                                    &prepared_action,
+                                    &dep_file_bundle,
+                                    &remote_dep_file_key,
+                                )
+                                .await?
+                            }
+                            res => res,
+                        };
                         (
                             req,
                             res.map_continue(|_| ctx.command_execution_manager(WaitingData::new())),

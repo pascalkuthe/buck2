@@ -249,6 +249,9 @@ pub struct CommandExecutionResult {
     /// The other stored results of the remote dep-file key (the `DepFileCandidates` auxiliary
     /// metadata), newest first; tried when `dep_file_metadata` does not match this build.
     pub dep_file_candidates: Vec<DepFileCandidate>,
+    /// The cache answered only from what it has on this machine: a lookup with
+    /// `DepFileCandidatesLookup::Refresh` may find more.
+    pub dep_file_candidates_local_only: bool,
     /// If the action executed on RE, the original action result
     /// to be re-used when uploading the remote dep file.
     #[derivative(Debug = "ignore")]

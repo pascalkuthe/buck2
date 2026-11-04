@@ -12,10 +12,34 @@ pub use crate::digest::*;
 use crate::grpc::Platform as TPlatform;
 use crate::response::TActionResult2;
 
+/// How a cache that keeps several results per remote dep-file key should answer a
+/// lookup of that key. Sent as the `x-kbuck-dep-file-candidates` gRPC header; any
+/// other cache ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepFileCandidatesLookup {
+    /// Answer from the candidates the cache has on this machine when there are any,
+    /// without asking a slower tier behind it.
+    LocalFirst,
+    /// None of the answered candidates matched: answer with the ones the slower tier
+    /// holds that have not been answered yet.
+    Refresh,
+}
+
+impl DepFileCandidatesLookup {
+    pub fn header_value(self) -> &'static str {
+        match self {
+            Self::LocalFirst => "local-first",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ActionResultRequest {
     pub digest: TDigest,
     pub platform: Option<TPlatform>,
+    /// How a cache that keeps several results per remote dep-file key should answer.
+    pub dep_file_candidates: Option<DepFileCandidatesLookup>,
     pub _dot_dot: (),
 }
 
