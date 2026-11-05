@@ -23,6 +23,9 @@ pub enum DepFileCandidatesLookup {
     /// None of the answered candidates matched: answer with the ones the slower tier
     /// holds that have not been answered yet.
     Refresh,
+    /// A dep-file action's full-key lookup when its full-key entries stay on this machine:
+    /// answer from this machine only, and no slower tier behind it.
+    LocalOnly,
 }
 
 impl DepFileCandidatesLookup {
@@ -30,6 +33,7 @@ impl DepFileCandidatesLookup {
         match self {
             Self::LocalFirst => "local-first",
             Self::Refresh => "refresh",
+            Self::LocalOnly => "local-only",
         }
     }
 }
@@ -188,5 +192,8 @@ pub struct WriteActionResultRequest {
     pub action_digest: TDigest,
     pub action_result: TActionResult2,
     pub platform: Option<TPlatform>,
+    /// Keep this result out of any slower tier behind the cache. Sent as the
+    /// `x-kbuck-local-only` gRPC header; any other cache ignores it.
+    pub local_only: bool,
     pub _dot_dot: (),
 }

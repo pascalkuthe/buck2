@@ -188,7 +188,11 @@ impl CacheUploader {
                             digest,
                             result,
                             &self.platform.to_re_platform(),
-                            ActionCacheWriteType::LocalCacheUpload,
+                            if has_depfile_entry && info.dep_file_full_key_local {
+                                ActionCacheWriteType::LocalCacheUploadLocalOnly
+                            } else {
+                                ActionCacheWriteType::LocalCacheUpload
+                            },
                         )
                         .await
                     {

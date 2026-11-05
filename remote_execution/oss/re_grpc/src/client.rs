@@ -715,17 +715,24 @@ impl REClient {
             let res = self
                 .action_cache_client()
                 .await?
-                .update_action_result(with_re_metadata(
-                    UpdateActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.action_digest.clone())),
-                        action_result: Some(action_result.clone()),
-                        results_cache_policy: None,
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
+                .update_action_result({
+                    let mut msg = with_re_metadata(
+                        UpdateActionResultRequest {
+                            instance_name: self.instance_name.as_str().to_owned(),
+                            action_digest: Some(tdigest_to(request.action_digest.clone())),
+                            action_result: Some(action_result.clone()),
+                            results_cache_policy: None,
+                            ..Default::default()
+                        },
+                        metadata,
+                        self.runtime_opts.use_fbcode_metadata,
+                    );
+                    if request.local_only {
+                        msg.metadata_mut()
+                            .insert("x-kbuck-local-only", MetadataValue::from_static("1"));
+                    }
+                    msg
+                })
                 .await?;
 
             Ok(WriteActionResultResponse {

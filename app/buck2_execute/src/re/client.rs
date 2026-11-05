@@ -119,6 +119,8 @@ use crate::re::uploader::Uploader;
 
 pub enum ActionCacheWriteType {
     LocalCacheUpload,
+    /// A dep-file action's full-key entry, which stays out of any tier behind the cache.
+    LocalCacheUploadLocalOnly,
     PermissionCheck,
     RemoteDepFile,
 }
@@ -126,6 +128,7 @@ impl ActionCacheWriteType {
     fn as_str(&self) -> &'static str {
         match *self {
             ActionCacheWriteType::LocalCacheUpload => "local_cache_upload",
+            ActionCacheWriteType::LocalCacheUploadLocalOnly => "local_cache_upload_local_only",
             ActionCacheWriteType::PermissionCheck => "permission_check",
             ActionCacheWriteType::RemoteDepFile => "remote_dep_file",
         }
@@ -1990,13 +1993,16 @@ impl RemoteExecutionClientImpl {
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
-        let (storage_cost_bytes, compute_cost_ms) =
-            if matches!(write_type, ActionCacheWriteType::LocalCacheUpload) {
-                let (storage, compute) = action_result_costs(&result);
-                (Some(storage), Some(compute))
-            } else {
-                (None, None)
-            };
+        let (storage_cost_bytes, compute_cost_ms) = if matches!(
+            write_type,
+            ActionCacheWriteType::LocalCacheUpload
+                | ActionCacheWriteType::LocalCacheUploadLocalOnly
+        ) {
+            let (storage, compute) = action_result_costs(&result);
+            (Some(storage), Some(compute))
+        } else {
+            (None, None)
+        };
 
         let attributes =
             BTreeMap::from([("write_type".to_owned(), write_type.as_str().to_owned())]);
@@ -2018,6 +2024,10 @@ impl RemoteExecutionClientImpl {
                         action_digest: digest.to_re(),
                         action_result: result,
                         platform: Some(re_platform(platform)),
+                        local_only: matches!(
+                            write_type,
+                            ActionCacheWriteType::LocalCacheUploadLocalOnly
+                        ),
                         ..Default::default()
                     },
                 )

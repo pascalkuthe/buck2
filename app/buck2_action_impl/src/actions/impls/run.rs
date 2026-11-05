@@ -1344,8 +1344,12 @@ impl RunAction {
             return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
         }
 
-        let req =
-            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
+        let full_key_local_only = ctx.run_action_knobs().dep_file_full_key_local
+            && self.inner.allow_dep_file_cache_upload
+            && dep_file_bundle.has_dep_files();
+        let req = self
+            .command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?
+            .with_full_key_local_only(full_key_local_only);
 
         // Prepare the action, check the action cache, fully check the local dep file cache if needed, then execute the command
         let prepared_action = ctx.prepare_action(&req, true)?;

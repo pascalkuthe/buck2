@@ -422,6 +422,8 @@ pub struct CommandExecutionRequest {
     /// The next remote dep-file lookup asks for the candidates the cache did not answer
     /// with yet, because none of those matched.
     refresh_dep_file_candidates: bool,
+    /// The full-key lookup asks this machine only (`buck2.dep_file_full_key_local`).
+    full_key_local_only: bool,
     /// For a test execution whose result is cached: the pack its result belongs in.
     /// See [`test_pack_key`].
     test_pack: Option<String>,
@@ -480,6 +482,7 @@ impl CommandExecutionRequest {
             unique_input_inodes: false,
             remote_dep_file_key: None,
             refresh_dep_file_candidates: false,
+            full_key_local_only: false,
             test_pack: None,
             re_gang_workers: Vec::new(),
             remote_execution_dependencies: Vec::new(),
@@ -571,6 +574,15 @@ impl CommandExecutionRequest {
 
     pub fn set_refresh_dep_file_candidates(&mut self, refresh: bool) {
         self.refresh_dep_file_candidates = refresh;
+    }
+
+    pub fn full_key_local_only(&self) -> bool {
+        self.full_key_local_only
+    }
+
+    pub fn with_full_key_local_only(mut self, local_only: bool) -> Self {
+        self.full_key_local_only = local_only;
+        self
     }
 
     pub fn test_pack(&self) -> Option<&str> {

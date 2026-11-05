@@ -1277,6 +1277,7 @@ impl BuckTestOrchestrator<'_> {
                     .await;
                 if !cached && *cacheable {
                     let info = CacheUploadInfo {
+                        dep_file_full_key_local: false,
                         target: &test_target as _,
                         digest_config,
                         mergebase: &None,

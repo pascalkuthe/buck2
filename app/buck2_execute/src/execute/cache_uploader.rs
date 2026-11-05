@@ -31,6 +31,9 @@ pub struct CacheUploadInfo<'a> {
     pub digest_config: DigestConfig,
     pub mergebase: &'a Option<String>,
     pub re_platform: &'a remote_execution::Platform,
+    /// A dep-file action's full-key entry stays on this machine
+    /// (`buck2.dep_file_full_key_local`).
+    pub dep_file_full_key_local: bool,
 }
 
 #[async_trait]

@@ -33,6 +33,11 @@ pub struct RunActionKnobs {
     /// next machine. Costs the action digest and an upload on every such hit.
     pub upload_dep_file_hits: bool,
 
+    /// Keep the entry under the action's own digest on this machine when the action has a
+    /// remote dep-file key: its full-key lookup asks this machine only, and its full-key
+    /// result is not published. Other machines find the result through the dep-file key.
+    pub dep_file_full_key_local: bool,
+
     pub action_paths_interner:
         Option<DashMapDirectoryInterner<ActionDirectoryMember, TrackedFileDigest>>,
 

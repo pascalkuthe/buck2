@@ -107,6 +107,9 @@ async fn query_action_cache_and_download_result(
             Some(DepFileCandidatesLookup::Refresh)
         }
         CacheType::RemoteDepFileCache(_) => Some(DepFileCandidatesLookup::LocalFirst),
+        CacheType::ActionCache if request.full_key_local_only() => {
+            Some(DepFileCandidatesLookup::LocalOnly)
+        }
         CacheType::ActionCache => None,
     };
     let test_pack = match &cache_type {
